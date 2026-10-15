@@ -68,6 +68,8 @@ button:disabled { opacity:.5; }
   <div class="row"><span>Speak replies</span><input type="checkbox" id="s-voice" checked></div>
   <label>Reply voice<select id="s-voicepick"></select></label>
   <button class="btn" id="s-voicetest" type="button" style="background:transparent;color:var(--accent);border:1px solid var(--border)">Test voice</button>
+  <div class="row"><span>Premium voice (ElevenLabs)</span><input type="checkbox" id="s-premium"></div>
+  <label>ElevenLabs voice ID (optional)<input type="text" id="s-elvoice" placeholder="leave blank for the default voice" autocapitalize="off"></label>
   <div class="row"><span>Send when I stop talking</span><input type="checkbox" id="s-autosend" checked></div>
   <button class="btn" id="s-save" type="button">Save</button>
   <button class="link" id="s-clear" type="button">Clear conversation</button>
@@ -84,7 +86,7 @@ button:disabled { opacity:.5; }
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   };
-  const cfg = { endpoint: store.get('endpoint', ''), token: store.get('token', ''), voice: store.get('voice', true), autosend: store.get('autosend', true), voiceURI: store.get('voiceURI', '') };
+  const cfg = { endpoint: store.get('endpoint', ''), token: store.get('token', ''), voice: store.get('voice', true), autosend: store.get('autosend', true), voiceURI: store.get('voiceURI', ''), premium: store.get('premium', false), elVoice: store.get('elVoice', '') };
   let attachFrame = store.get('attach', true);
   let facing = 'environment';
   let stream = null;
@@ -191,9 +193,33 @@ button:disabled { opacity:.5; }
       speechSynthesis.speak(u);
     } catch {}
   }
+  let player = null;
+  function stopAudio() {
+    try { if (player) { player.pause(); player.src = ''; player = null; } } catch {}
+    try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch {}
+  }
+  function ttsUrl() { return (cfg.endpoint || '').replace(/\/[^/]*$/, '/tts'); }
+  async function speakPremium(text, voiceId) {
+    const res = await fetch(ttsUrl(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.token },
+      body: JSON.stringify({ text, voice_id: ((voiceId || cfg.elVoice || '').trim()) || undefined }),
+    });
+    if (!res.ok) throw new Error('tts ' + res.status);
+    const blob = await res.blob();
+    const u = URL.createObjectURL(blob);
+    stopAudio();
+    player = new Audio(u);
+    player.onended = () => { try { URL.revokeObjectURL(u); } catch {} };
+    await player.play();
+  }
   function speak(text) {
     if (!cfg.voice || !text) return;
-    speakWith(text, bestVoice());
+    if (cfg.premium && cfg.endpoint && cfg.token) {
+      speakPremium(text).catch(() => speakWith(text, bestVoice()));
+    } else {
+      speakWith(text, bestVoice());
+    }
   }
 
   async function send() {
@@ -203,7 +229,7 @@ button:disabled { opacity:.5; }
     if (!question && !image) return;
     if (!cfg.endpoint || !cfg.token) { openSettings(); status('Set the endpoint and token first.'); return; }
     busy = true; els.send.disabled = true; stopListening();
-    if (window.speechSynthesis) speechSynthesis.cancel();
+    stopAudio();
     els.q.value = '';
     add('user', question || '(photo)', image);
     const thinking = add('sys', 'Thinking…');
@@ -233,20 +259,28 @@ button:disabled { opacity:.5; }
   function openSettings() {
     $('s-endpoint').value = cfg.endpoint; $('s-token').value = cfg.token;
     $('s-voice').checked = cfg.voice; $('s-autosend').checked = cfg.autosend;
+    $('s-premium').checked = cfg.premium; $('s-elvoice').value = cfg.elVoice;
     loadVoices(); $('s-voicepick').value = cfg.voiceURI || '';
     els.settings.classList.add('open');
   }
   $('s-save').onclick = () => {
     cfg.endpoint = $('s-endpoint').value.trim(); cfg.token = $('s-token').value.trim();
     cfg.voice = $('s-voice').checked; cfg.autosend = $('s-autosend').checked;
-    for (const k of ['endpoint', 'token', 'voice', 'autosend']) store.set(k, cfg[k]);
+    cfg.voiceURI = $('s-voicepick').value;
+    cfg.premium = $('s-premium').checked; cfg.elVoice = $('s-elvoice').value.trim();
+    for (const k of ['endpoint', 'token', 'voice', 'autosend', 'voiceURI', 'premium', 'elVoice']) store.set(k, cfg[k]);
     els.settings.classList.remove('open');
   };
   $('s-clear').onclick = () => { history = []; store.set('history', history); renderHistory(); els.settings.classList.remove('open'); };
   $('s-voicetest').onclick = () => {
+    const sample = 'Hi, this is your assistant. How do I sound?';
     const uri = $('s-voicepick').value;
-    const v = uri ? voices.find((x) => x.voiceURI === uri) : bestVoice();
-    speakWith('Hi, this is your assistant. How do I sound?', v);
+    const nativeTest = () => speakWith(sample, uri ? voices.find((x) => x.voiceURI === uri) : bestVoice());
+    if ($('s-premium').checked && cfg.endpoint && cfg.token) {
+      speakPremium(sample, $('s-elvoice').value).catch((e) => { status('Premium voice failed (' + e.message + '); using the phone voice.'); nativeTest(); });
+    } else {
+      nativeTest();
+    }
   };
   els.gear.onclick = openSettings;
   els.flip.onclick = () => { facing = facing === 'environment' ? 'user' : 'environment'; startCamera(); };
