@@ -38,7 +38,7 @@ button:disabled { opacity:.5; }
 #settings { position:fixed; inset:0; background:var(--bg); display:none; flex-direction:column; padding:calc(16px + env(safe-area-inset-top)) 16px 16px; gap:12px; overflow:auto; z-index:10; }
 #settings.open { display:flex; }
 #settings label { display:flex; flex-direction:column; gap:4px; font-size:14px; color:var(--muted); }
-#settings input[type=text], #settings input[type=password], #settings input[type=url] { padding:10px; border-radius:10px; border:1px solid var(--border); background:var(--panel); color:var(--text); font:inherit; }
+#settings input[type=text], #settings input[type=password], #settings input[type=url], #settings select { padding:10px; border-radius:10px; border:1px solid var(--border); background:var(--panel); color:var(--text); font:inherit; }
 #settings .row { display:flex; align-items:center; justify-content:space-between; color:var(--text); }
 #settings .btn { padding:12px; border-radius:12px; border:0; background:var(--accent); color:#fff; font:inherit; }
 #settings .link { background:transparent; color:var(--danger); border:0; font:inherit; padding:8px; }
@@ -66,10 +66,13 @@ button:disabled { opacity:.5; }
   <label>Assistant endpoint<input type="url" id="s-endpoint" placeholder="https://xxxx.supabase.co/functions/v1/assistant-live" autocapitalize="off"></label>
   <label>Access token<input type="password" id="s-token" autocomplete="off"></label>
   <div class="row"><span>Speak replies</span><input type="checkbox" id="s-voice" checked></div>
+  <label>Reply voice<select id="s-voicepick"></select></label>
+  <button class="btn" id="s-voicetest" type="button" style="background:transparent;color:var(--accent);border:1px solid var(--border)">Test voice</button>
   <div class="row"><span>Send when I stop talking</span><input type="checkbox" id="s-autosend" checked></div>
   <button class="btn" id="s-save" type="button">Save</button>
   <button class="link" id="s-clear" type="button">Clear conversation</button>
   <p>Settings stay on this phone. The token is what lets this page reach your assistant; do not share it.</p>
+  <p>For the most natural voices on an iPhone, download a few in Settings → Accessibility → Spoken Content → Voices, then pick one above and tap Test voice.</p>
 </section>
 <canvas id="canvas" hidden></canvas>
 <script>
@@ -81,7 +84,7 @@ button:disabled { opacity:.5; }
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   };
-  const cfg = { endpoint: store.get('endpoint', ''), token: store.get('token', ''), voice: store.get('voice', true), autosend: store.get('autosend', true) };
+  const cfg = { endpoint: store.get('endpoint', ''), token: store.get('token', ''), voice: store.get('voice', true), autosend: store.get('autosend', true), voiceURI: store.get('voiceURI', '') };
   let attachFrame = store.get('attach', true);
   let facing = 'environment';
   let stream = null;
@@ -152,9 +155,45 @@ button:disabled { opacity:.5; }
     listening = false;
     els.mic.classList.remove('active');
   }
+  let voices = [];
+  function voiceScore(v) {
+    const n = (v.name || '').toLowerCase();
+    const ui = (navigator.language || 'en').slice(0, 2).toLowerCase();
+    let s = 0;
+    if (/siri|natural|neural|enhanced|premium/.test(n)) s += 3;
+    if (v.localService) s += 1;
+    if ((v.lang || '').toLowerCase().startsWith(ui)) s += 2;
+    return s;
+  }
+  function loadVoices() {
+    try { voices = (window.speechSynthesis ? speechSynthesis.getVoices() : []) || []; } catch { voices = []; }
+    voices = voices.slice().sort((a, b) => voiceScore(b) - voiceScore(a) || a.name.localeCompare(b.name));
+    populateVoiceSelect();
+  }
+  function bestVoice() {
+    if (cfg.voiceURI) { const m = voices.find((v) => v.voiceURI === cfg.voiceURI); if (m) return m; }
+    return voices[0] || null;
+  }
+  function populateVoiceSelect() {
+    const sel = $('s-voicepick'); if (!sel) return;
+    sel.innerHTML = '';
+    const auto = document.createElement('option'); auto.value = ''; auto.textContent = 'Automatic (best available)'; sel.appendChild(auto);
+    for (const v of voices) { const o = document.createElement('option'); o.value = v.voiceURI; o.textContent = v.name + ' (' + v.lang + ')'; sel.appendChild(o); }
+    sel.value = cfg.voiceURI || '';
+  }
+  function speakWith(text, voice) {
+    if (!window.speechSynthesis || !text) return;
+    try {
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      if (voice) { u.voice = voice; u.lang = voice.lang; } else { u.lang = navigator.language || 'en-US'; }
+      u.rate = 1.0; u.pitch = 1.0;
+      speechSynthesis.speak(u);
+    } catch {}
+  }
   function speak(text) {
-    if (!cfg.voice || !window.speechSynthesis || !text) return;
-    try { speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.lang = navigator.language || 'en-US'; speechSynthesis.speak(u); } catch {}
+    if (!cfg.voice || !text) return;
+    speakWith(text, bestVoice());
   }
 
   async function send() {
@@ -194,6 +233,7 @@ button:disabled { opacity:.5; }
   function openSettings() {
     $('s-endpoint').value = cfg.endpoint; $('s-token').value = cfg.token;
     $('s-voice').checked = cfg.voice; $('s-autosend').checked = cfg.autosend;
+    loadVoices(); $('s-voicepick').value = cfg.voiceURI || '';
     els.settings.classList.add('open');
   }
   $('s-save').onclick = () => {
@@ -203,6 +243,11 @@ button:disabled { opacity:.5; }
     els.settings.classList.remove('open');
   };
   $('s-clear').onclick = () => { history = []; store.set('history', history); renderHistory(); els.settings.classList.remove('open'); };
+  $('s-voicetest').onclick = () => {
+    const uri = $('s-voicepick').value;
+    const v = uri ? voices.find((x) => x.voiceURI === uri) : bestVoice();
+    speakWith('Hi, this is your assistant. How do I sound?', v);
+  };
   els.gear.onclick = openSettings;
   els.flip.onclick = () => { facing = facing === 'environment' ? 'user' : 'environment'; startCamera(); };
   els.video.onclick = () => { if (!stream) startCamera(); };
@@ -215,6 +260,7 @@ button:disabled { opacity:.5; }
   renderHistory();
   if (!cfg.endpoint || !cfg.token) add('sys', 'Open Settings and paste your assistant endpoint and access token.');
   startCamera();
+  if (window.speechSynthesis) { try { speechSynthesis.onvoiceschanged = loadVoices; } catch {} loadVoices(); }
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 })();
 </script>
