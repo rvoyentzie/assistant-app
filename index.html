@@ -304,7 +304,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   function status(t){ const el = $('status'); if (!t){ el.classList.remove('show'); return; } el.textContent = t; el.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 3200); }
 
   // ---- Camera / live mode ----
-  let stream = null, facing = 'environment', liveOpen = false;
+  let stream = null, facing = 'environment', liveOpen = false, convoOn = false;
   async function startCamera(el){
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ status('No camera support here.'); return false; }
     if (stream) stream.getTracks().forEach((t) => t.stop());
@@ -318,37 +318,87 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     const c = $('canvas'); c.width = Math.round(v.videoWidth * scale); c.height = Math.round(v.videoHeight * scale);
     c.getContext('2d').drawImage(v, 0, 0, c.width, c.height); return c.toDataURL('image/jpeg', 0.8).split(',')[1];
   }
-  async function openLive(){ liveOpen = true; $('live').classList.add('open'); $('lcaption').textContent = 'Point the camera and tap the mic to ask about what you see.'; await startCamera($('lvideo')); }
-  function closeLive(){ liveOpen = false; $('live').classList.remove('open'); stopCamera(); stopListening(); }
-
-  // ---- Speech recognition ----
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let rec = null, listening = false;
-  function micEl(){ return liveOpen ? $('lmic') : $('mic'); }
-  function startListening(){
-    if (!SR){ status('Voice input is not supported here.'); return; }
-    if (listening) return;
-    rec = new SR(); rec.lang = navigator.language || 'en-US'; rec.interimResults = true; rec.continuous = false;
-    let finalText = '';
-    rec.onresult = (ev) => { let interim = ''; for (let i = ev.resultIndex; i < ev.results.length; i++){ const r = ev.results[i]; if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript; } const t = (finalText + ' ' + interim).trim(); if (liveOpen) $('lcaption').textContent = t || '…'; else $('q').value = t; };
-    rec.onerror = (ev) => { status('Mic: ' + ev.error); stopListening(); };
-    rec.onend = () => { listening = false; micEl().classList.remove('active'); const said = liveOpen ? ($('lcaption').textContent || '').trim() : $('q').value.trim(); if ((cfg.autosend || liveOpen) && said && said !== '…') send(liveOpen ? said : undefined); };
-    try{ rec.start(); listening = true; micEl().classList.add('active'); if (!liveOpen) status('Listening…'); }
-    catch(e){ status('Mic: ' + e.message); }
+  function sleep(ms){ return new Promise((r) => setTimeout(r, ms)); }
+  async function openLive(){
+    liveOpen = true; $('live').classList.add('open'); $('lcaption').textContent = 'Starting…';
+    await startCamera($('lvideo'));
+    if (!cfg.endpoint || !cfg.token){ $('lcaption').textContent = 'Add your endpoint and token in Settings first.'; return; }
+    if (!voiceSupported()){ $('lcaption').textContent = 'Voice is not available here.'; return; }
+    resumeConvo();
   }
-  function stopListening(){ if (rec && listening){ try{ rec.stop(); }catch{} } listening = false; $('mic').classList.remove('active'); $('lmic').classList.remove('active'); }
+  function closeLive(){ convoOn = false; liveOpen = false; $('live').classList.remove('open'); stopListening(); stopAudio(); stopCamera(); $('lmic').classList.remove('active'); }
+  function pauseConvo(){ convoOn = false; stopListening(); stopAudio(); $('lmic').classList.remove('active'); $('lcaption').textContent = 'Paused — tap the mic to talk.'; }
+  function resumeConvo(){ if (convoOn) return; convoOn = true; convoLoop(); }
+  // Hands-free loop: listen, auto-send when you stop talking, speak the reply, then listen again.
+  async function convoLoop(){
+    while (convoOn){
+      $('lcaption').textContent = 'Listening…'; $('lmic').classList.add('active');
+      const text = await listenOnce();
+      if (!convoOn) break;
+      if (!text){ await sleep(250); continue; }
+      $('lmic').classList.remove('active');
+      await send(text);
+      if (!convoOn) break;
+      await sleep(250);
+    }
+  }
+
+  // ---- Speech recognition: browser Web Speech API, or the native plugin in the Android app ----
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  function getNativeSR(){ const C = window.Capacitor; return (C && C.isNativePlatform && C.isNativePlatform() && C.Plugins && C.Plugins.SpeechRecognition) ? C.Plugins.SpeechRecognition : null; }
+  function voiceSupported(){ return !!(getNativeSR() || SR); }
+  let rec = null, listening = false, stopListenFn = null;
+  function micEl(){ return liveOpen ? $('lmic') : $('mic'); }
+  function setHeard(t){ if (liveOpen) $('lcaption').textContent = t || '…'; else $('q').value = t; }
+
+  // Listen for one utterance; resolves with the final transcript ('' if nothing was heard). The
+  // recognizer itself detects when you stop talking and ends, which is what triggers auto-send.
+  function listenOnce(){
+    return new Promise(async (resolve) => {
+      let done = false;
+      const finish = (t) => { if (done) return; done = true; listening = false; micEl().classList.remove('active'); stopListenFn = null; resolve((t || '').trim()); };
+      const NSR = getNativeSR();
+      if (NSR){
+        try { let p = await NSR.checkPermissions(); if (p.speechRecognition !== 'granted'){ p = await NSR.requestPermissions(); if (p.speechRecognition !== 'granted'){ status('Allow the microphone to use voice.'); return finish(''); } } } catch {}
+        let partial = '';
+        try { await NSR.removeAllListeners(); } catch {}
+        try {
+          await NSR.addListener('partialResults', (d) => { const m = (d && d.matches && d.matches[0]) || ''; if (m){ partial = m; setHeard(m); } });
+          await NSR.addListener('listeningState', (d) => { if (d && d.status === 'stopped') finish(partial); });
+        } catch {}
+        listening = true; micEl().classList.add('active');
+        stopListenFn = async () => { try { await NSR.stop(); } catch {} finish(partial); };
+        try { await NSR.start({ language: navigator.language || 'en-US', partialResults: true, popup: false }); }
+        catch(e){ status('Mic: ' + (e.message || e)); finish(''); }
+        return;
+      }
+      if (SR){
+        rec = new SR(); rec.lang = navigator.language || 'en-US'; rec.interimResults = true; rec.continuous = false;
+        let finalText = '';
+        rec.onresult = (ev) => { let interim = ''; for (let i = ev.resultIndex; i < ev.results.length; i++){ const r = ev.results[i]; if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript; } setHeard((finalText + ' ' + interim).trim()); };
+        rec.onerror = (ev) => { if (ev.error && ev.error !== 'no-speech' && ev.error !== 'aborted') status('Mic: ' + ev.error); };
+        rec.onend = () => finish(finalText);
+        listening = true; micEl().classList.add('active');
+        stopListenFn = () => { try { rec.stop(); } catch {} };
+        try { rec.start(); } catch(e){ status('Mic: ' + e.message); finish(''); }
+        return;
+      }
+      status('Voice input is not supported here.'); finish('');
+    });
+  }
+  function stopListening(){ const f = stopListenFn; stopListenFn = null; if (f) f(); }
 
   // ---- Voice output ----
   let voices = [];
   function voiceScore(v){ const n = (v.name||'').toLowerCase(), ui = (navigator.language||'en').slice(0,2).toLowerCase(); let s=0; if(/siri|natural|neural|enhanced|premium/.test(n))s+=3; if(v.localService)s+=1; if((v.lang||'').toLowerCase().startsWith(ui))s+=2; return s; }
   function loadVoices(){ try{ voices=(window.speechSynthesis?speechSynthesis.getVoices():[])||[]; }catch{ voices=[]; } voices=voices.slice().sort((a,b)=>voiceScore(b)-voiceScore(a)||a.name.localeCompare(b.name)); const sel=$('s-voicepick'); if(!sel)return; sel.innerHTML=''; const a=document.createElement('option'); a.value=''; a.textContent='Automatic (best available)'; sel.appendChild(a); for(const v of voices){ const o=document.createElement('option'); o.value=v.voiceURI; o.textContent=v.name+' ('+v.lang+')'; sel.appendChild(o);} sel.value=cfg.voiceURI||''; }
   function bestVoice(){ if(cfg.voiceURI){ const m=voices.find(v=>v.voiceURI===cfg.voiceURI); if(m)return m; } return voices[0]||null; }
-  function speakWith(text, voice){ if(!window.speechSynthesis||!text)return; try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text); if(voice){u.voice=voice;u.lang=voice.lang;}else u.lang=navigator.language||'en-US'; u.rate=1;u.pitch=1; speechSynthesis.speak(u);}catch{} }
+  function speakWith(text, voice){ return new Promise((resolve) => { if(!window.speechSynthesis||!text){ resolve(); return; } try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text); if(voice){u.voice=voice;u.lang=voice.lang;}else u.lang=navigator.language||'en-US'; u.rate=1;u.pitch=1; u.onend=()=>resolve(); u.onerror=()=>resolve(); speechSynthesis.speak(u);}catch{ resolve(); } }); }
   let player = null;
-  function stopAudio(){ try{ if(player){player.pause();player.src='';player=null;} }catch{} try{ if(window.speechSynthesis)speechSynthesis.cancel(); }catch{} }
+  function stopAudio(){ try{ if(player){ player.onended=null; player.pause(); player.src=''; player=null; } }catch{} try{ if(window.speechSynthesis)speechSynthesis.cancel(); }catch{} }
   function ttsUrl(){ return (cfg.endpoint||'').replace(/\/[^/]*$/, '/tts'); }
-  async function speakPremium(text, voiceId){ const res=await fetch(ttsUrl(),{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+cfg.token},body:JSON.stringify({text,voice_id:((voiceId||cfg.elVoice||'').trim())||undefined})}); if(!res.ok)throw new Error('tts '+res.status); const blob=await res.blob(),u=URL.createObjectURL(blob); stopAudio(); player=new Audio(u); player.onended=()=>{try{URL.revokeObjectURL(u);}catch{}}; await player.play(); }
-  function speak(text){ if(!cfg.voice||!text)return; if(cfg.premium&&cfg.endpoint&&cfg.token) speakPremium(text).catch(()=>speakWith(text,bestVoice())); else speakWith(text,bestVoice()); }
+  async function speakPremium(text, voiceId){ const res=await fetch(ttsUrl(),{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+cfg.token},body:JSON.stringify({text,voice_id:((voiceId||cfg.elVoice||'').trim())||undefined})}); if(!res.ok)throw new Error('tts '+res.status); const blob=await res.blob(),u=URL.createObjectURL(blob); stopAudio(); await new Promise((resolve)=>{ player=new Audio(u); player.onended=()=>{try{URL.revokeObjectURL(u);}catch{} resolve();}; player.onerror=()=>resolve(); player.play().catch(()=>resolve()); }); }
+  async function speak(text){ if(!cfg.voice||!text)return; if(cfg.premium&&cfg.endpoint&&cfg.token){ try{ await speakPremium(text); }catch{ await speakWith(text,bestVoice()); } } else { await speakWith(text,bestVoice()); } }
   async function loadPremiumVoices(){ const sel=$('s-elvoice'); if(!sel)return; sel.innerHTML=''; const def=document.createElement('option'); def.value=''; def.textContent='Automatic (default)'; sel.appendChild(def); sel.value=cfg.elVoice||''; if(!cfg.endpoint||!cfg.token)return; try{ const res=await fetch(ttsUrl(),{headers:{'Authorization':'Bearer '+cfg.token}}); if(!res.ok)return; const data=await res.json(); for(const v of (data.voices||[])){ const o=document.createElement('option'); o.value=v.id; o.textContent=v.name; sel.appendChild(o);} sel.value=cfg.elVoice||''; }catch{} }
 
   // ---- Send ----
@@ -379,7 +429,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
       chat.messages.push({ role: 'assistant', content: answer }); chat.updatedAt = Date.now(); saveChats();
       if (!liveOpen){ bubble('bot', answer); for (const ev of (data.tool_events || [])) bubble('sys', ev.name + ': ' + ev.summary); scrollToBottom(); renderDrawer(); }
       else { $('lcaption').textContent = answer; }
-      speak(answer);
+      await speak(answer);
     }catch(e){ if (thinking) thinking.remove(); const em = 'Network error: ' + e.message; if (!liveOpen){ bubble('sys', em); scrollToBottom(); } else status(em); }
     finally{ busy = false; $('send').disabled = false; }
   }
@@ -399,8 +449,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   $('camera').onclick = openLive;
   $('lclose').onclick = closeLive;
   $('lflip').onclick = async () => { facing = facing === 'environment' ? 'user' : 'environment'; await startCamera($('lvideo')); };
-  $('lmic').onclick = () => (listening ? stopListening() : startListening());
-  $('mic').onclick = () => (listening ? stopListening() : startListening());
+  $('lmic').onclick = () => { if (convoOn) pauseConvo(); else resumeConvo(); };
+  $('mic').onclick = async () => { if (listening){ stopListening(); return; } const t = await listenOnce(); if (t){ $('q').value = t; if (cfg.autosend) send(); } };
   $('composer').onsubmit = (e) => { e.preventDefault(); send(); };
   $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
   $('q').addEventListener('input', (e) => { const t = e.target; t.style.height = 'auto'; t.style.height = Math.min(150, t.scrollHeight) + 'px'; });
