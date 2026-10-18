@@ -214,6 +214,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     <div class="group">
       <h3>Behavior</h3>
       <div class="row"><span>Send when I stop talking</span><label class="switch"><input type="checkbox" id="s-autosend" checked><span></span></label></div>
+      <label class="field">Pause before sending<select id="s-pause"><option value="quick">Quick — sends sooner, may cut you off</option><option value="normal">Normal</option><option value="patient">Patient — waits longer for you</option></select></label>
     </div>
     <p class="hint" id="verline" style="text-align:center"></p>
   </div>
@@ -224,7 +225,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 12:24 · 4205bad';
+  const BUILD = '2026-10-18 12:38 · e18e1b2';
   const store = {
     get(k, d){ try{ const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }catch{ return d; } },
     set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch{} },
@@ -233,6 +234,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     endpoint: store.get('endpoint',''), token: store.get('token',''),
     voice: store.get('voice', true), autosend: store.get('autosend', true),
     voiceURI: store.get('voiceURI',''), premium: store.get('premium', false), elVoice: store.get('elVoice',''),
+    pause: store.get('pause', 'normal'),
   };
   let busy = false;
 
@@ -359,10 +361,15 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   function setHeard(t){ if (liveOpen) $('lcaption').textContent = t || '…'; else $('q').value = t; }
   function setListenUI(on){ (liveOpen ? $('lmic') : $('mic')).classList.toggle('active', on); }
   let turnStop = null;
-  const END_SILENCE_MS = 1400;  // how long you can pause before it decides you're done talking
+  // How long you can be quiet before it decides you're done talking (Settings → Pause before sending).
+  // Measured from when the recognizer is actually listening; Android's own ~1 s end-of-phrase
+  // silence plus the restart come on top, so the real pause is roughly 2.5 / 3 / 4 seconds.
+  const PAUSE_MS = { quick: 1000, normal: 1600, patient: 2600 };
+  // If you trail off on one of these, you're probably mid-thought: wait longer before sending.
+  const TRAILING = /\b(and|but|or|so|then|because|um|uh|like|with|to|the|a|an|of|for|if|that|is|are|was|about|at|in|on)[,.]?$/i;
 
   // One conversational turn. Android's recognizer ends on a short pause and ignores silence hints,
-  // so we keep restarting it and only finish after you've been quiet for END_SILENCE_MS, which
+  // so we keep restarting it and only finish after you've been quiet for the pause window, which
   // stops it from cutting you off mid-sentence. Resolves with the full transcript.
   function listenTurn(onPartial){
     return new Promise((resolve) => {
@@ -371,7 +378,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
       const cleanups = [() => clearTimeout(silence)];
       const full = () => (committed + ' ' + sessionText).replace(/\s+/g, ' ').trim();
       const finishNow = () => { if (done) return; done = true; cleanups.forEach((f) => { try { f(); } catch {} }); turnStop = null; resolve(full()); };
-      const bump = () => { clearTimeout(silence); silence = setTimeout(endTurn, END_SILENCE_MS); };
+      const pauseMs = () => { const base = PAUSE_MS[cfg.pause] || PAUSE_MS.normal; return TRAILING.test(full()) ? Math.round(base * 1.7) : base; };
+      const bump = () => { clearTimeout(silence); silence = setTimeout(endTurn, pauseMs()); };
       let stopCur = () => {};
       // End the turn: stop the recognizer but give it a moment to deliver its FINAL result first.
       // The last word usually arrives only in that final, not in the live partials.
@@ -388,7 +396,10 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
           awaitingFinal = false; clearTimeout(finalWait); sessionAlive = false;
           if (sessionText){ committed = (committed + ' ' + sessionText).trim(); sessionText = ''; onPartial && onPartial(full()); }
           if (!active){ finishNow(); return; }
-          if (full()) bump();   // you've said something: wait END_SILENCE_MS for more before sending
+          // Don't run the silence clock while the recognizer is restarting: it isn't hearing you yet,
+          // and the first partial of a new session can take over a second to arrive. The clock
+          // starts again only once the next session is actually listening (see startSession).
+          clearTimeout(silence);
           if (!restarting){ restarting = true; setTimeout(() => { restarting = false; if (active) startSession(); }, 120); }
         }
         async function startSession(){
@@ -409,7 +420,10 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
             });
           } catch {}
           sessionAlive = true; sessionStartedAt = Date.now();
-          try { await NSR.start({ language: navigator.language || 'en-US', partialResults: true, popup: false }); }
+          try {
+            await NSR.start({ language: navigator.language || 'en-US', partialResults: true, popup: false });
+            if (active && full()) bump();   // now listening again: if nothing more is heard within the pause window, send
+          }
           catch(e){ sessionAlive = false; if (active && !restarting){ restarting = true; setTimeout(() => { restarting = false; if (active) startSession(); }, 250); } }
         }
         // Watchdog: the recognizer can end on an error (e.g. no speech) with no event, which would
@@ -487,8 +501,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   }
 
   // ---- Settings ----
-  function openSettings(){ $('s-endpoint').value=cfg.endpoint; $('s-token').value=cfg.token; $('s-voice').checked=cfg.voice; $('s-autosend').checked=cfg.autosend; $('s-premium').checked=cfg.premium; loadVoices(); $('s-voicepick').value=cfg.voiceURI||''; loadPremiumVoices(); $('verline').textContent = 'Version ' + (BUILD.startsWith('__') ? 'dev (unpublished)' : BUILD); closeDrawer(); $('settings').classList.add('open'); }
-  function saveSettings(){ cfg.endpoint=$('s-endpoint').value.trim(); cfg.token=$('s-token').value.trim(); cfg.voice=$('s-voice').checked; cfg.autosend=$('s-autosend').checked; cfg.voiceURI=$('s-voicepick').value; cfg.premium=$('s-premium').checked; cfg.elVoice=$('s-elvoice').value; for(const k of ['endpoint','token','voice','autosend','voiceURI','premium','elVoice']) store.set(k,cfg[k]); }
+  function openSettings(){ $('s-endpoint').value=cfg.endpoint; $('s-token').value=cfg.token; $('s-voice').checked=cfg.voice; $('s-autosend').checked=cfg.autosend; $('s-pause').value=cfg.pause||'normal'; $('s-premium').checked=cfg.premium; loadVoices(); $('s-voicepick').value=cfg.voiceURI||''; loadPremiumVoices(); $('verline').textContent = 'Version ' + (BUILD.startsWith('__') ? 'dev (unpublished)' : BUILD); closeDrawer(); $('settings').classList.add('open'); }
+  function saveSettings(){ cfg.endpoint=$('s-endpoint').value.trim(); cfg.token=$('s-token').value.trim(); cfg.voice=$('s-voice').checked; cfg.autosend=$('s-autosend').checked; cfg.pause=$('s-pause').value||'normal'; cfg.voiceURI=$('s-voicepick').value; cfg.premium=$('s-premium').checked; cfg.elVoice=$('s-elvoice').value; for(const k of ['endpoint','token','voice','autosend','pause','voiceURI','premium','elVoice']) store.set(k,cfg[k]); }
 
   // ---- Wire up ----
   $('menu').onclick = openDrawer;
