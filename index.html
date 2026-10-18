@@ -214,6 +214,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     <div class="group">
       <h3>Behavior</h3>
       <div class="row"><span>Send when I stop talking</span><label class="switch"><input type="checkbox" id="s-autosend" checked><span></span></label></div>
+      <label class="field">Speech recognition<select id="s-stt"><option value="eleven">ElevenLabs streaming (recommended)</option><option value="phone">Phone's built-in recognizer</option></select></label>
       <label class="field">Pause before sending<select id="s-pause"><option value="quick">Quick — sends sooner, may cut you off</option><option value="normal">Normal</option><option value="patient">Patient — waits longer for you</option></select></label>
     </div>
     <p class="hint" id="verline" style="text-align:center"></p>
@@ -225,7 +226,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 12:38 · e18e1b2';
+  const BUILD = '2026-10-18 13:48 · ec4b879';
   const store = {
     get(k, d){ try{ const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }catch{ return d; } },
     set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch{} },
@@ -234,7 +235,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     endpoint: store.get('endpoint',''), token: store.get('token',''),
     voice: store.get('voice', true), autosend: store.get('autosend', true),
     voiceURI: store.get('voiceURI',''), premium: store.get('premium', false), elVoice: store.get('elVoice',''),
-    pause: store.get('pause', 'normal'),
+    pause: store.get('pause', 'normal'), stt: store.get('stt', 'eleven'),
   };
   let busy = false;
 
@@ -336,9 +337,9 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     if (convoOn) return;
     if (!voiceSupported()){ status('Voice is not available here.'); return; }
     if (!cfg.endpoint || !cfg.token){ openSettings(); status('Add your endpoint and token first.'); return; }
-    convoOn = true; convoLoop();
+    convoOn = true; prefetchSttToken(); convoLoop();
   }
-  function stopConvo(){ convoOn = false; stopTurn(); stopAudio(); setListenUI(false); }
+  function stopConvo(){ convoOn = false; stopTurn(); stopAudio(); setListenUI(false); closeMic(); }
   // Hands-free loop: listen (continuously), auto-send once you pause, speak the reply, then listen again.
   async function convoLoop(){
     while (convoOn){
@@ -357,7 +358,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   // ---- Speech recognition: browser Web Speech API, or the native plugin in the Android app ----
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   function getNativeSR(){ const C = window.Capacitor; return (C && C.isNativePlatform && C.isNativePlatform() && C.Plugins && C.Plugins.SpeechRecognition) ? C.Plugins.SpeechRecognition : null; }
-  function voiceSupported(){ return !!(getNativeSR() || SR); }
+  function hasMic(){ return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia); }
+  function voiceSupported(){ return !!(getNativeSR() || SR || hasMic()); }
   function setHeard(t){ if (liveOpen) $('lcaption').textContent = t || '…'; else $('q').value = t; }
   function setListenUI(on){ (liveOpen ? $('lmic') : $('mic')).classList.toggle('active', on); }
   let turnStop = null;
@@ -371,7 +373,15 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   // One conversational turn. Android's recognizer ends on a short pause and ignores silence hints,
   // so we keep restarting it and only finish after you've been quiet for the pause window, which
   // stops it from cutting you off mid-sentence. Resolves with the full transcript.
-  function listenTurn(onPartial){
+  async function listenTurn(onPartial){
+    if (cfg.stt !== 'phone' && hasMic() && Date.now() > sttDownUntil){
+      const text = await listenTurnStream(onPartial);
+      if (text !== null) return text;      // null = streaming unavailable right now; fall through
+      if (!(getNativeSR() || SR)) return '';
+    }
+    return listenTurnDevice(onPartial);
+  }
+  function listenTurnDevice(onPartial){
     return new Promise((resolve) => {
       const NSR = getNativeSR();
       let committed = '', sessionText = '', active = true, restarting = false, silence = null, done = false;
@@ -454,6 +464,91 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   }
   function stopTurn(){ if (turnStop) turnStop(); }
 
+  // ---- Streaming speech-to-text: ElevenLabs Scribe v2 Realtime ----
+  // The mic stays open for the whole turn and raw PCM is streamed over a WebSocket; the
+  // service's own voice-activity detection decides when you've finished (committed_transcript),
+  // so there are no restart gaps and nothing gets cut off. The API key stays on the server:
+  // the stt-token function mints a single-use token per connection.
+  const VAD_SILENCE = { quick: 1.0, normal: 1.5, patient: 2.5 };   // seconds of quiet before a commit
+  const STT_RATES = [8000, 16000, 22050, 24000, 44100, 48000];
+  let sttDownUntil = 0, micStream = null, micCtx = null, micSrc = null, micProc = null, micSink = null, micOnAudio = null, nextTok = null;
+  function sttUrl(){ return (cfg.endpoint||'').replace(/\/[^/]*$/, '/stt-token'); }
+  async function fetchSttToken(){
+    const res = await fetch(sttUrl(), { method:'POST', headers:{ 'Authorization':'Bearer '+cfg.token } });
+    if (!res.ok) throw new Error('stt-token ' + res.status);
+    const d = await res.json(); if (!d.token) throw new Error('no token');
+    return { token: d.token, ws: d.ws || 'wss://api.elevenlabs.io/v1/speech-to-text/realtime', at: Date.now() };
+  }
+  // Tokens are single-use and last 15 minutes; keep one ready so the next turn starts without waiting.
+  function prefetchSttToken(){ if (cfg.stt === 'phone' || !cfg.endpoint || !cfg.token) return; if (nextTok && Date.now() - nextTok.at < 10*60*1000) return; nextTok = null; fetchSttToken().then((t) => { nextTok = t; }).catch(() => {}); }
+  async function takeSttToken(){ const t = (nextTok && Date.now() - nextTok.at < 10*60*1000) ? nextTok : await fetchSttToken(); nextTok = null; return t; }
+  async function openMic(){
+    if (micStream && micStream.active && micCtx) { if (micCtx.state !== 'running') await micCtx.resume().catch(() => {}); return; }
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
+    const AC = window.AudioContext || window.webkitAudioContext;
+    try { micCtx = new AC({ sampleRate: 16000 }); } catch { micCtx = new AC(); }
+    if (micCtx.state !== 'running') await micCtx.resume().catch(() => {});
+    micSrc = micCtx.createMediaStreamSource(micStream);
+    micProc = micCtx.createScriptProcessor(4096, 1, 1);
+    micProc.onaudioprocess = (e) => { if (micOnAudio) micOnAudio(e.inputBuffer.getChannelData(0)); };
+    micSink = micCtx.createGain(); micSink.gain.value = 0;   // the processor only runs when connected to the output
+    micSrc.connect(micProc); micProc.connect(micSink); micSink.connect(micCtx.destination);
+  }
+  function closeMic(){ micOnAudio = null; try { micProc && micProc.disconnect(); micSrc && micSrc.disconnect(); micSink && micSink.disconnect(); } catch {} try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch {} try { micCtx && micCtx.close(); } catch {} micStream = micCtx = micSrc = micProc = micSink = null; }
+  function pcm16b64(f32, from, to){
+    // Float32 at the context rate -> 16-bit PCM at `to` Hz (plain decimation is fine for speech), base64.
+    const ratio = from / to, n = Math.floor(f32.length / ratio), out = new Int16Array(n);
+    for (let i = 0; i < n; i++){ const s = Math.max(-1, Math.min(1, f32[Math.floor(i * ratio)])); out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF; }
+    const bytes = new Uint8Array(out.buffer); let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x4000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x4000));
+    return btoa(bin);
+  }
+  // One turn over the stream. Resolves with the text, or null if streaming couldn't start
+  // (no token, no mic, connection refused) so the caller can fall back to the device recognizer.
+  function listenTurnStream(onPartial){
+    return new Promise(async (resolve) => {
+      let ws = null, committed = '', partial = '', done = false, started = false, trailingWait = null, startTimer = null;
+      const full = () => (committed + ' ' + partial).replace(/\s+/g, ' ').trim();
+      const finish = (val) => { if (done) return; done = true; clearTimeout(trailingWait); clearTimeout(startTimer); micOnAudio = null; turnStop = null; try { ws && ws.close(); } catch {} resolve(val); };
+      const unavailable = (why) => { sttDownUntil = Date.now() + 60*1000; status('Streaming voice unavailable (' + why + '); using the phone recognizer for a minute.'); finish(null); };
+      turnStop = () => finish(full());
+      try { await openMic(); } catch (e) { unavailable('mic: ' + ((e && e.name) || 'blocked')); return; }
+      let tok; try { tok = await takeSttToken(); } catch (e) { unavailable(e.message); return; }
+      if (done) return;
+      const ctxRate = micCtx.sampleRate, rate = STT_RATES.includes(ctxRate) ? ctxRate : 16000;
+      const silence = VAD_SILENCE[cfg.pause] || VAD_SILENCE.normal;
+      const lang = (navigator.language || 'en').slice(0, 2).toLowerCase();
+      const url = tok.ws + '?model_id=scribe_v2_realtime&audio_format=pcm_' + rate + '&language_code=' + lang +
+        '&commit_strategy=vad&vad_silence_threshold_secs=' + silence + '&min_silence_duration_ms=200&token=' + encodeURIComponent(tok.token);
+      try { ws = new WebSocket(url); } catch (e) { unavailable('socket'); return; }
+      startTimer = setTimeout(() => { if (!started) unavailable('no answer'); }, 8000);
+      ws.onerror = () => { if (!started) unavailable('connect'); };
+      ws.onclose = (ev) => { if (!started) unavailable('closed ' + ev.code); else finish(full()); };
+      ws.onmessage = (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch { return; }
+        const t = m.message_type;
+        if (t === 'session_started'){
+          started = true; clearTimeout(startTimer);
+          micOnAudio = (f32) => { if (ws.readyState === 1) ws.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: pcm16b64(f32, ctxRate, rate), commit: false, sample_rate: rate })); };
+          prefetchSttToken();
+        } else if (t === 'partial_transcript'){
+          partial = m.text || ''; if (partial){ clearTimeout(trailingWait); trailingWait = null; onPartial && onPartial(full()); }
+        } else if (t === 'committed_transcript'){
+          if (m.text && m.text.trim()) committed = (committed + ' ' + m.text.trim()).trim();
+          partial = ''; onPartial && onPartial(full());
+          if (!full()) return;                        // a commit of silence/noise: keep listening
+          // Trailing off on "and", "but", "um"? You're probably mid-thought: give it a few more seconds.
+          if (TRAILING.test(full())){ clearTimeout(trailingWait); trailingWait = setTimeout(() => finish(full()), 2500); return; }
+          finish(full());
+        } else if (t === 'warning'){
+          /* ignore */
+        } else if (typeof t === 'string' && /error|exceeded|limited|overflow|exhausted|unaccepted/.test(t)){
+          if (!started) unavailable(t); else if (full()) finish(full()); else { status('Voice stream ended (' + t + ').'); finish(''); }
+        }
+      };
+    });
+  }
+
   // ---- Voice output ----
   let voices = [];
   function voiceScore(v){ const n = (v.name||'').toLowerCase(), ui = (navigator.language||'en').slice(0,2).toLowerCase(); let s=0; if(/siri|natural|neural|enhanced|premium/.test(n))s+=3; if(v.localService)s+=1; if((v.lang||'').toLowerCase().startsWith(ui))s+=2; return s; }
@@ -501,8 +596,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   }
 
   // ---- Settings ----
-  function openSettings(){ $('s-endpoint').value=cfg.endpoint; $('s-token').value=cfg.token; $('s-voice').checked=cfg.voice; $('s-autosend').checked=cfg.autosend; $('s-pause').value=cfg.pause||'normal'; $('s-premium').checked=cfg.premium; loadVoices(); $('s-voicepick').value=cfg.voiceURI||''; loadPremiumVoices(); $('verline').textContent = 'Version ' + (BUILD.startsWith('__') ? 'dev (unpublished)' : BUILD); closeDrawer(); $('settings').classList.add('open'); }
-  function saveSettings(){ cfg.endpoint=$('s-endpoint').value.trim(); cfg.token=$('s-token').value.trim(); cfg.voice=$('s-voice').checked; cfg.autosend=$('s-autosend').checked; cfg.pause=$('s-pause').value||'normal'; cfg.voiceURI=$('s-voicepick').value; cfg.premium=$('s-premium').checked; cfg.elVoice=$('s-elvoice').value; for(const k of ['endpoint','token','voice','autosend','pause','voiceURI','premium','elVoice']) store.set(k,cfg[k]); }
+  function openSettings(){ $('s-endpoint').value=cfg.endpoint; $('s-token').value=cfg.token; $('s-voice').checked=cfg.voice; $('s-autosend').checked=cfg.autosend; $('s-pause').value=cfg.pause||'normal'; $('s-stt').value=cfg.stt||'eleven'; $('s-premium').checked=cfg.premium; loadVoices(); $('s-voicepick').value=cfg.voiceURI||''; loadPremiumVoices(); $('verline').textContent = 'Version ' + (BUILD.startsWith('__') ? 'dev (unpublished)' : BUILD); closeDrawer(); $('settings').classList.add('open'); }
+  function saveSettings(){ cfg.endpoint=$('s-endpoint').value.trim(); cfg.token=$('s-token').value.trim(); cfg.voice=$('s-voice').checked; cfg.autosend=$('s-autosend').checked; cfg.pause=$('s-pause').value||'normal'; cfg.stt=$('s-stt').value||'eleven'; cfg.voiceURI=$('s-voicepick').value; cfg.premium=$('s-premium').checked; cfg.elVoice=$('s-elvoice').value; for(const k of ['endpoint','token','voice','autosend','pause','stt','voiceURI','premium','elVoice']) store.set(k,cfg[k]); }
 
   // ---- Wire up ----
   $('menu').onclick = openDrawer;
