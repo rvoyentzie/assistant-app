@@ -230,7 +230,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 14:13 · b7f1eef';
+  const BUILD = '2026-10-18 14:15 · 38c74af';
   const diag = [];
   function dlog(m){ try { console.log('[voice] ' + m); } catch {} const d = new Date(); diag.push(d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0') + ' ' + m); if (diag.length > 60) diag.shift(); const el = $('diag'); if (el) el.textContent = diag.join('\n'); }
   window.addEventListener('error', (e) => dlog('JS error: ' + (e.message || e.type)));
@@ -584,7 +584,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   function bestVoice(){ if(cfg.voiceURI){ const m=voices.find(v=>v.voiceURI===cfg.voiceURI); if(m)return m; } return voices[0]||null; }
   function speakWith(text, voice){ return new Promise((resolve) => { if(!window.speechSynthesis||!text){ resolve(); return; } try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text); if(voice){u.voice=voice;u.lang=voice.lang;}else u.lang=navigator.language||'en-US'; u.rate=1;u.pitch=1; u.onend=()=>resolve(); u.onerror=(e)=>{ status('Phone voice failed: ' + ((e && e.error) || 'error')); resolve(); }; speechSynthesis.speak(u);}catch{ status('Phone voice unavailable.'); resolve(); } }); }
   let player = null;
-  function stopAudio(){ try{ if(player){ player.onended=null; player.pause(); player.src=''; player=null; } }catch{} try{ if(window.speechSynthesis)speechSynthesis.cancel(); }catch{} }
+  function stopAudio(){ try{ if(player){ const p=player; player=null; p.onended=p.onerror=p.onplaying=null; p.pause(); p.src=''; } }catch{} try{ if(window.speechSynthesis)speechSynthesis.cancel(); }catch{} }
   function ttsUrl(){ return (cfg.endpoint||'').replace(/\/[^/]*$/, '/tts'); }
   async function speakPremium(text, voiceId){
     const t0 = Date.now();
@@ -598,7 +598,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
       const started = Date.now(); let tries = 0;
       player = new Audio(u); player.volume = 1;
       player.onended = () => { dlog('play: ended after ' + (Date.now() - started) + 'ms (duration ' + (player && player.duration ? player.duration.toFixed(1) : '?') + 's)'); try { URL.revokeObjectURL(u); } catch {} resolve(); };
-      player.onerror = () => { dlog('play: error ' + (player && player.error ? player.error.code : '?')); status('Voice playback failed.'); resolve(); };
+      const el = player;
+      el.onerror = () => { if (player !== el) return; dlog('play: error ' + (el.error ? el.error.code : '?')); status('Voice playback failed.'); resolve(); };
       player.onplaying = () => dlog('play: playing (duration ' + (player && player.duration ? player.duration.toFixed(1) : '?') + 's)');
       const go = () => player.play().then(() => dlog('play: started')).catch((e) => {
         dlog('play: rejected ' + ((e && e.name) || e) + (tries ? '' : ', retrying'));
