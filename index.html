@@ -230,7 +230,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 14:09 · da5cee3';
+  const BUILD = '2026-10-18 14:13 · b7f1eef';
   const diag = [];
   function dlog(m){ try { console.log('[voice] ' + m); } catch {} const d = new Date(); diag.push(d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0') + ' ' + m); if (diag.length > 60) diag.shift(); const el = $('diag'); if (el) el.textContent = diag.join('\n'); }
   window.addEventListener('error', (e) => dlog('JS error: ' + (e.message || e.type)));
@@ -609,11 +609,12 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   }
   async function speak(text){
     if (!cfg.voice || !text){ dlog('speak: skipped (voice ' + (cfg.voice ? 'on' : 'OFF') + ')'); return; }
-    if (cfg.premium && cfg.endpoint && cfg.token){
+    // The Android app's WebView has no speech synthesis of its own, so there the premium voice is the only voice: use it whenever it's configured.
+    if ((cfg.premium || !window.speechSynthesis) && cfg.endpoint && cfg.token){
       try { dlog('speak: premium'); await speakPremium(text); return; }
       catch (e) { dlog('speak: premium failed ' + (e && e.message || e)); status('Premium voice failed (' + (e && e.message || 'error') + '); using phone voice.'); }
     } else dlog('speak: phone voice (premium ' + (cfg.premium ? 'on' : 'OFF') + ')');
-    if (!window.speechSynthesis) dlog('speak: no speechSynthesis on this device');
+    if (!window.speechSynthesis){ dlog('speak: no speechSynthesis on this device'); status('This phone has no built-in voice; turn on Premium voice in Settings.'); }
     await speakWith(text, bestVoice());
   }
   async function loadPremiumVoices(){ const sel=$('s-elvoice'); if(!sel)return; sel.innerHTML=''; const def=document.createElement('option'); def.value=''; def.textContent='Automatic (default)'; sel.appendChild(def); sel.value=cfg.elVoice||''; if(!cfg.endpoint||!cfg.token)return; try{ const res=await fetch(ttsUrl(),{headers:{'Authorization':'Bearer '+cfg.token}}); if(!res.ok)return; const data=await res.json(); for(const v of (data.voices||[])){ const o=document.createElement('option'); o.value=v.id; o.textContent=v.name; sel.appendChild(o);} sel.value=cfg.elVoice||''; }catch{} }
