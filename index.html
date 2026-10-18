@@ -226,7 +226,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 13:48 · ec4b879';
+  const BUILD = '2026-10-18 13:51 · fa7d1df';
   const store = {
     get(k, d){ try{ const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }catch{ return d; } },
     set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch{} },
@@ -482,19 +482,27 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   // Tokens are single-use and last 15 minutes; keep one ready so the next turn starts without waiting.
   function prefetchSttToken(){ if (cfg.stt === 'phone' || !cfg.endpoint || !cfg.token) return; if (nextTok && Date.now() - nextTok.at < 10*60*1000) return; nextTok = null; fetchSttToken().then((t) => { nextTok = t; }).catch(() => {}); }
   async function takeSttToken(){ const t = (nextTok && Date.now() - nextTok.at < 10*60*1000) ? nextTok : await fetchSttToken(); nextTok = null; return t; }
+  // The AudioContext is created once (it needs the tap that started the conversation) and kept;
+  // the microphone itself is opened per turn and released as soon as the turn ends. While a
+  // capture is active Android switches to "call" audio routing, which makes the spoken reply
+  // quiet or sends it to the earpiece, so the mic must be off whenever the assistant talks.
   async function openMic(){
-    if (micStream && micStream.active && micCtx) { if (micCtx.state !== 'running') await micCtx.resume().catch(() => {}); return; }
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
-    const AC = window.AudioContext || window.webkitAudioContext;
-    try { micCtx = new AC({ sampleRate: 16000 }); } catch { micCtx = new AC(); }
+    if (!micCtx){
+      const AC = window.AudioContext || window.webkitAudioContext;
+      try { micCtx = new AC({ sampleRate: 16000 }); } catch { micCtx = new AC(); }
+      micProc = micCtx.createScriptProcessor(4096, 1, 1);
+      micProc.onaudioprocess = (e) => { if (micOnAudio) micOnAudio(e.inputBuffer.getChannelData(0)); };
+      micSink = micCtx.createGain(); micSink.gain.value = 0;   // the processor only runs when connected to the output
+      micProc.connect(micSink); micSink.connect(micCtx.destination);
+    }
     if (micCtx.state !== 'running') await micCtx.resume().catch(() => {});
+    if (micStream && micStream.active) return;
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
     micSrc = micCtx.createMediaStreamSource(micStream);
-    micProc = micCtx.createScriptProcessor(4096, 1, 1);
-    micProc.onaudioprocess = (e) => { if (micOnAudio) micOnAudio(e.inputBuffer.getChannelData(0)); };
-    micSink = micCtx.createGain(); micSink.gain.value = 0;   // the processor only runs when connected to the output
-    micSrc.connect(micProc); micProc.connect(micSink); micSink.connect(micCtx.destination);
+    micSrc.connect(micProc);
   }
-  function closeMic(){ micOnAudio = null; try { micProc && micProc.disconnect(); micSrc && micSrc.disconnect(); micSink && micSink.disconnect(); } catch {} try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch {} try { micCtx && micCtx.close(); } catch {} micStream = micCtx = micSrc = micProc = micSink = null; }
+  function releaseMic(){ micOnAudio = null; try { micSrc && micSrc.disconnect(); } catch {} try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch {} micStream = micSrc = null; }
+  function closeMic(){ releaseMic(); try { micProc && micProc.disconnect(); micSink && micSink.disconnect(); } catch {} try { micCtx && micCtx.close(); } catch {} micCtx = micProc = micSink = null; }
   function pcm16b64(f32, from, to){
     // Float32 at the context rate -> 16-bit PCM at `to` Hz (plain decimation is fine for speech), base64.
     const ratio = from / to, n = Math.floor(f32.length / ratio), out = new Int16Array(n);
@@ -509,7 +517,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     return new Promise(async (resolve) => {
       let ws = null, committed = '', partial = '', done = false, started = false, trailingWait = null, startTimer = null;
       const full = () => (committed + ' ' + partial).replace(/\s+/g, ' ').trim();
-      const finish = (val) => { if (done) return; done = true; clearTimeout(trailingWait); clearTimeout(startTimer); micOnAudio = null; turnStop = null; try { ws && ws.close(); } catch {} resolve(val); };
+      const finish = (val) => { if (done) return; done = true; clearTimeout(trailingWait); clearTimeout(startTimer); releaseMic(); turnStop = null; try { ws && ws.close(); } catch {} resolve(val); };
       const unavailable = (why) => { sttDownUntil = Date.now() + 60*1000; status('Streaming voice unavailable (' + why + '); using the phone recognizer for a minute.'); finish(null); };
       turnStop = () => finish(full());
       try { await openMic(); } catch (e) { unavailable('mic: ' + ((e && e.name) || 'blocked')); return; }
