@@ -226,7 +226,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 13:51 · fa7d1df';
+  const BUILD = '2026-10-18 13:54 · 74bbc72';
   const store = {
     get(k, d){ try{ const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }catch{ return d; } },
     set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch{} },
@@ -470,7 +470,6 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   // so there are no restart gaps and nothing gets cut off. The API key stays on the server:
   // the stt-token function mints a single-use token per connection.
   const VAD_SILENCE = { quick: 1.0, normal: 1.5, patient: 2.5 };   // seconds of quiet before a commit
-  const STT_RATES = [8000, 16000, 22050, 24000, 44100, 48000];
   let sttDownUntil = 0, micStream = null, micCtx = null, micSrc = null, micProc = null, micSink = null, micOnAudio = null, nextTok = null;
   function sttUrl(){ return (cfg.endpoint||'').replace(/\/[^/]*$/, '/stt-token'); }
   async function fetchSttToken(){
@@ -482,31 +481,38 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   // Tokens are single-use and last 15 minutes; keep one ready so the next turn starts without waiting.
   function prefetchSttToken(){ if (cfg.stt === 'phone' || !cfg.endpoint || !cfg.token) return; if (nextTok && Date.now() - nextTok.at < 10*60*1000) return; nextTok = null; fetchSttToken().then((t) => { nextTok = t; }).catch(() => {}); }
   async function takeSttToken(){ const t = (nextTok && Date.now() - nextTok.at < 10*60*1000) ? nextTok : await fetchSttToken(); nextTok = null; return t; }
-  // The AudioContext is created once (it needs the tap that started the conversation) and kept;
-  // the microphone itself is opened per turn and released as soon as the turn ends. While a
-  // capture is active Android switches to "call" audio routing, which makes the spoken reply
-  // quiet or sends it to the earpiece, so the mic must be off whenever the assistant talks.
+  // Everything about capture is built per turn and torn down the moment the turn ends. Android
+  // routes audio like a phone call (earpiece, low volume) while a capture with echo cancellation
+  // is active, and that can stick as long as the capture's AudioContext lives, which is what
+  // silenced the spoken replies. So: no echo cancellation (the mic is off while the assistant
+  // talks anyway), and nothing audio-related survives between turns.
   async function openMic(){
-    if (!micCtx){
-      const AC = window.AudioContext || window.webkitAudioContext;
-      try { micCtx = new AC({ sampleRate: 16000 }); } catch { micCtx = new AC(); }
-      micProc = micCtx.createScriptProcessor(4096, 1, 1);
-      micProc.onaudioprocess = (e) => { if (micOnAudio) micOnAudio(e.inputBuffer.getChannelData(0)); };
-      micSink = micCtx.createGain(); micSink.gain.value = 0;   // the processor only runs when connected to the output
-      micProc.connect(micSink); micSink.connect(micCtx.destination);
-    }
+    closeMic();
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: true, autoGainControl: true }, video: false });
+    const AC = window.AudioContext || window.webkitAudioContext;
+    micCtx = new AC();
     if (micCtx.state !== 'running') await micCtx.resume().catch(() => {});
-    if (micStream && micStream.active) return;
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
+    micProc = micCtx.createScriptProcessor(4096, 1, 1);
+    micProc.onaudioprocess = (e) => { if (micOnAudio) micOnAudio(e.inputBuffer.getChannelData(0)); };
+    micSink = micCtx.createGain(); micSink.gain.value = 0;   // the processor only runs when connected to the output
     micSrc = micCtx.createMediaStreamSource(micStream);
-    micSrc.connect(micProc);
+    micSrc.connect(micProc); micProc.connect(micSink); micSink.connect(micCtx.destination);
   }
-  function releaseMic(){ micOnAudio = null; try { micSrc && micSrc.disconnect(); } catch {} try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch {} micStream = micSrc = null; }
-  function closeMic(){ releaseMic(); try { micProc && micProc.disconnect(); micSink && micSink.disconnect(); } catch {} try { micCtx && micCtx.close(); } catch {} micCtx = micProc = micSink = null; }
+  function closeMic(){
+    micOnAudio = null;
+    try { micSrc && micSrc.disconnect(); micProc && micProc.disconnect(); micSink && micSink.disconnect(); } catch {}
+    try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch {}
+    try { micCtx && micCtx.close(); } catch {}
+    micStream = micCtx = micSrc = micProc = micSink = null;
+  }
   function pcm16b64(f32, from, to){
-    // Float32 at the context rate -> 16-bit PCM at `to` Hz (plain decimation is fine for speech), base64.
+    // Float32 at the context rate -> 16-bit PCM at `to` Hz (box-averaged downsample), base64.
     const ratio = from / to, n = Math.floor(f32.length / ratio), out = new Int16Array(n);
-    for (let i = 0; i < n; i++){ const s = Math.max(-1, Math.min(1, f32[Math.floor(i * ratio)])); out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF; }
+    for (let i = 0; i < n; i++){
+      const a = Math.floor(i * ratio), b = Math.max(a + 1, Math.floor((i + 1) * ratio)); let sum = 0;
+      for (let j = a; j < b; j++) sum += f32[j];
+      const s = Math.max(-1, Math.min(1, sum / (b - a))); out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
     const bytes = new Uint8Array(out.buffer); let bin = '';
     for (let i = 0; i < bytes.length; i += 0x4000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x4000));
     return btoa(bin);
@@ -517,13 +523,13 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     return new Promise(async (resolve) => {
       let ws = null, committed = '', partial = '', done = false, started = false, trailingWait = null, startTimer = null;
       const full = () => (committed + ' ' + partial).replace(/\s+/g, ' ').trim();
-      const finish = (val) => { if (done) return; done = true; clearTimeout(trailingWait); clearTimeout(startTimer); releaseMic(); turnStop = null; try { ws && ws.close(); } catch {} resolve(val); };
+      const finish = (val) => { if (done) return; done = true; clearTimeout(trailingWait); clearTimeout(startTimer); closeMic(); turnStop = null; try { ws && ws.close(); } catch {} resolve(val); };
       const unavailable = (why) => { sttDownUntil = Date.now() + 60*1000; status('Streaming voice unavailable (' + why + '); using the phone recognizer for a minute.'); finish(null); };
       turnStop = () => finish(full());
       try { await openMic(); } catch (e) { unavailable('mic: ' + ((e && e.name) || 'blocked')); return; }
       let tok; try { tok = await takeSttToken(); } catch (e) { unavailable(e.message); return; }
       if (done) return;
-      const ctxRate = micCtx.sampleRate, rate = STT_RATES.includes(ctxRate) ? ctxRate : 16000;
+      const ctxRate = micCtx.sampleRate, rate = 16000;   // always send 16 kHz: a third of the bandwidth of 48 kHz, and what the model prefers
       const silence = VAD_SILENCE[cfg.pause] || VAD_SILENCE.normal;
       const lang = (navigator.language || 'en').slice(0, 2).toLowerCase();
       const url = tok.ws + '?model_id=scribe_v2_realtime&audio_format=pcm_' + rate + '&language_code=' + lang +
@@ -562,12 +568,12 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   function voiceScore(v){ const n = (v.name||'').toLowerCase(), ui = (navigator.language||'en').slice(0,2).toLowerCase(); let s=0; if(/siri|natural|neural|enhanced|premium/.test(n))s+=3; if(v.localService)s+=1; if((v.lang||'').toLowerCase().startsWith(ui))s+=2; return s; }
   function loadVoices(){ try{ voices=(window.speechSynthesis?speechSynthesis.getVoices():[])||[]; }catch{ voices=[]; } voices=voices.slice().sort((a,b)=>voiceScore(b)-voiceScore(a)||a.name.localeCompare(b.name)); const sel=$('s-voicepick'); if(!sel)return; sel.innerHTML=''; const a=document.createElement('option'); a.value=''; a.textContent='Automatic (best available)'; sel.appendChild(a); for(const v of voices){ const o=document.createElement('option'); o.value=v.voiceURI; o.textContent=v.name+' ('+v.lang+')'; sel.appendChild(o);} sel.value=cfg.voiceURI||''; }
   function bestVoice(){ if(cfg.voiceURI){ const m=voices.find(v=>v.voiceURI===cfg.voiceURI); if(m)return m; } return voices[0]||null; }
-  function speakWith(text, voice){ return new Promise((resolve) => { if(!window.speechSynthesis||!text){ resolve(); return; } try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text); if(voice){u.voice=voice;u.lang=voice.lang;}else u.lang=navigator.language||'en-US'; u.rate=1;u.pitch=1; u.onend=()=>resolve(); u.onerror=()=>resolve(); speechSynthesis.speak(u);}catch{ resolve(); } }); }
+  function speakWith(text, voice){ return new Promise((resolve) => { if(!window.speechSynthesis||!text){ resolve(); return; } try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text); if(voice){u.voice=voice;u.lang=voice.lang;}else u.lang=navigator.language||'en-US'; u.rate=1;u.pitch=1; u.onend=()=>resolve(); u.onerror=(e)=>{ status('Phone voice failed: ' + ((e && e.error) || 'error')); resolve(); }; speechSynthesis.speak(u);}catch{ status('Phone voice unavailable.'); resolve(); } }); }
   let player = null;
   function stopAudio(){ try{ if(player){ player.onended=null; player.pause(); player.src=''; player=null; } }catch{} try{ if(window.speechSynthesis)speechSynthesis.cancel(); }catch{} }
   function ttsUrl(){ return (cfg.endpoint||'').replace(/\/[^/]*$/, '/tts'); }
-  async function speakPremium(text, voiceId){ const res=await fetch(ttsUrl(),{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+cfg.token},body:JSON.stringify({text,voice_id:((voiceId||cfg.elVoice||'').trim())||undefined})}); if(!res.ok)throw new Error('tts '+res.status); const blob=await res.blob(),u=URL.createObjectURL(blob); stopAudio(); await new Promise((resolve)=>{ player=new Audio(u); player.onended=()=>{try{URL.revokeObjectURL(u);}catch{} resolve();}; player.onerror=()=>resolve(); player.play().catch(()=>resolve()); }); }
-  async function speak(text){ if(!cfg.voice||!text)return; if(cfg.premium&&cfg.endpoint&&cfg.token){ try{ await speakPremium(text); }catch{ await speakWith(text,bestVoice()); } } else { await speakWith(text,bestVoice()); } }
+  async function speakPremium(text, voiceId){ const res=await fetch(ttsUrl(),{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+cfg.token},body:JSON.stringify({text,voice_id:((voiceId||cfg.elVoice||'').trim())||undefined})}); if(!res.ok)throw new Error('tts '+res.status); const blob=await res.blob(),u=URL.createObjectURL(blob); stopAudio(); await new Promise((resolve)=>{ player=new Audio(u); player.onended=()=>{try{URL.revokeObjectURL(u);}catch{} resolve();}; player.onerror=()=>{ status('Voice playback failed.'); resolve(); }; player.play().catch((e)=>{ status('Voice playback blocked: ' + ((e && e.name) || 'error')); resolve(); }); }); }
+  async function speak(text){ if(!cfg.voice||!text)return; if(cfg.premium&&cfg.endpoint&&cfg.token){ try{ await speakPremium(text); }catch(e){ status('Premium voice failed (' + (e && e.message || 'error') + '); using phone voice.'); await speakWith(text,bestVoice()); } } else { await speakWith(text,bestVoice()); } }
   async function loadPremiumVoices(){ const sel=$('s-elvoice'); if(!sel)return; sel.innerHTML=''; const def=document.createElement('option'); def.value=''; def.textContent='Automatic (default)'; sel.appendChild(def); sel.value=cfg.elVoice||''; if(!cfg.endpoint||!cfg.token)return; try{ const res=await fetch(ttsUrl(),{headers:{'Authorization':'Bearer '+cfg.token}}); if(!res.ok)return; const data=await res.json(); for(const v of (data.voices||[])){ const o=document.createElement('option'); o.value=v.id; o.textContent=v.name; sel.appendChild(o);} sel.value=cfg.elVoice||''; }catch{} }
 
   // ---- Send ----
