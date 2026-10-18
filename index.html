@@ -324,22 +324,28 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     await startCamera($('lvideo'));
     if (!cfg.endpoint || !cfg.token){ $('lcaption').textContent = 'Add your endpoint and token in Settings first.'; return; }
     if (!voiceSupported()){ $('lcaption').textContent = 'Voice is not available here.'; return; }
-    resumeConvo();
+    startConvo();
   }
-  function closeLive(){ convoOn = false; liveOpen = false; $('live').classList.remove('open'); stopListening(); stopAudio(); stopCamera(); $('lmic').classList.remove('active'); }
-  function pauseConvo(){ convoOn = false; stopListening(); stopAudio(); $('lmic').classList.remove('active'); $('lcaption').textContent = 'Paused — tap the mic to talk.'; }
-  function resumeConvo(){ if (convoOn) return; convoOn = true; convoLoop(); }
-  // Hands-free loop: listen, auto-send when you stop talking, speak the reply, then listen again.
+  function closeLive(){ stopConvo(); liveOpen = false; $('live').classList.remove('open'); stopCamera(); }
+  function startConvo(){
+    if (convoOn) return;
+    if (!voiceSupported()){ status('Voice is not available here.'); return; }
+    if (!cfg.endpoint || !cfg.token){ openSettings(); status('Add your endpoint and token first.'); return; }
+    convoOn = true; convoLoop();
+  }
+  function stopConvo(){ convoOn = false; stopTurn(); stopAudio(); setListenUI(false); }
+  // Hands-free loop: listen (continuously), auto-send once you pause, speak the reply, then listen again.
   async function convoLoop(){
     while (convoOn){
-      $('lcaption').textContent = 'Listening…'; $('lmic').classList.add('active');
-      const text = await listenOnce();
+      if (liveOpen) $('lcaption').textContent = 'Listening…'; else status('Listening…');
+      setListenUI(true);
+      const text = await listenTurn((p) => setHeard(p));
+      setListenUI(false);
       if (!convoOn) break;
-      if (!text){ await sleep(250); continue; }
-      $('lmic').classList.remove('active');
+      if (!text){ await sleep(150); continue; }
       await send(text);
       if (!convoOn) break;
-      await sleep(250);
+      await sleep(150);
     }
   }
 
@@ -347,46 +353,58 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   function getNativeSR(){ const C = window.Capacitor; return (C && C.isNativePlatform && C.isNativePlatform() && C.Plugins && C.Plugins.SpeechRecognition) ? C.Plugins.SpeechRecognition : null; }
   function voiceSupported(){ return !!(getNativeSR() || SR); }
-  let rec = null, listening = false, stopListenFn = null;
-  function micEl(){ return liveOpen ? $('lmic') : $('mic'); }
   function setHeard(t){ if (liveOpen) $('lcaption').textContent = t || '…'; else $('q').value = t; }
+  function setListenUI(on){ (liveOpen ? $('lmic') : $('mic')).classList.toggle('active', on); }
+  let turnStop = null;
+  const END_SILENCE_MS = 1400;  // how long you can pause before it decides you're done talking
 
-  // Listen for one utterance; resolves with the final transcript ('' if nothing was heard). The
-  // recognizer itself detects when you stop talking and ends, which is what triggers auto-send.
-  function listenOnce(){
-    return new Promise(async (resolve) => {
-      let done = false;
-      const finish = (t) => { if (done) return; done = true; listening = false; micEl().classList.remove('active'); stopListenFn = null; resolve((t || '').trim()); };
+  // One conversational turn. Android's recognizer ends on a short pause and ignores silence hints,
+  // so we keep restarting it and only finish after you've been quiet for END_SILENCE_MS, which
+  // stops it from cutting you off mid-sentence. Resolves with the full transcript.
+  function listenTurn(onPartial){
+    return new Promise((resolve) => {
       const NSR = getNativeSR();
+      let committed = '', sessionText = '', active = true, restarting = false, silence = null, stopCur = () => {};
+      const full = () => (committed + ' ' + sessionText).replace(/\s+/g, ' ').trim();
+      const bump = () => { clearTimeout(silence); silence = setTimeout(endTurn, END_SILENCE_MS); };
+      function endTurn(){ if (!active) return; active = false; clearTimeout(silence); try { stopCur(); } catch {} turnStop = null; resolve(full()); }
+      turnStop = endTurn;
       if (NSR){
-        try { let p = await NSR.checkPermissions(); if (p.speechRecognition !== 'granted'){ p = await NSR.requestPermissions(); if (p.speechRecognition !== 'granted'){ status('Allow the microphone to use voice.'); return finish(''); } } } catch {}
-        let partial = '';
-        try { await NSR.removeAllListeners(); } catch {}
-        try {
-          await NSR.addListener('partialResults', (d) => { const m = (d && d.matches && d.matches[0]) || ''; if (m){ partial = m; setHeard(m); } });
-          await NSR.addListener('listeningState', (d) => { if (d && d.status === 'stopped') finish(partial); });
-        } catch {}
-        listening = true; micEl().classList.add('active');
-        stopListenFn = async () => { try { await NSR.stop(); } catch {} finish(partial); };
-        try { await NSR.start({ language: navigator.language || 'en-US', partialResults: true, popup: false }); }
-        catch(e){ status('Mic: ' + (e.message || e)); finish(''); }
+        stopCur = async () => { try { await NSR.stop(); } catch {} try { await NSR.removeAllListeners(); } catch {} };
+        async function startSession(){
+          sessionText = '';
+          try { await NSR.removeAllListeners(); } catch {}
+          try {
+            await NSR.addListener('partialResults', (d) => { const m = (d && d.matches && d.matches[0]) || ''; if (m){ sessionText = m; onPartial && onPartial(full()); bump(); } });
+            await NSR.addListener('listeningState', (d) => {
+              if (d && d.status === 'stopped'){
+                if (sessionText){ committed = (committed + ' ' + sessionText).trim(); sessionText = ''; }
+                if (active && !restarting){ restarting = true; setTimeout(() => { restarting = false; if (active) startSession(); }, 120); }
+              }
+            });
+          } catch {}
+          try { await NSR.start({ language: navigator.language || 'en-US', partialResults: true, popup: false }); }
+          catch(e){ if (active && !restarting){ restarting = true; setTimeout(() => { restarting = false; if (active) startSession(); }, 250); } }
+        }
+        (async () => {
+          try { let p = await NSR.checkPermissions(); if (p.speechRecognition !== 'granted'){ p = await NSR.requestPermissions(); if (p.speechRecognition !== 'granted'){ status('Allow the microphone to use voice.'); active = false; turnStop = null; resolve(''); return; } } } catch {}
+          startSession();
+        })();
         return;
       }
       if (SR){
-        rec = new SR(); rec.lang = navigator.language || 'en-US'; rec.interimResults = true; rec.continuous = false;
-        let finalText = '';
-        rec.onresult = (ev) => { let interim = ''; for (let i = ev.resultIndex; i < ev.results.length; i++){ const r = ev.results[i]; if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript; } setHeard((finalText + ' ' + interim).trim()); };
-        rec.onerror = (ev) => { if (ev.error && ev.error !== 'no-speech' && ev.error !== 'aborted') status('Mic: ' + ev.error); };
-        rec.onend = () => finish(finalText);
-        listening = true; micEl().classList.add('active');
-        stopListenFn = () => { try { rec.stop(); } catch {} };
-        try { rec.start(); } catch(e){ status('Mic: ' + e.message); finish(''); }
+        const r = new SR(); r.lang = navigator.language || 'en-US'; r.interimResults = true; r.continuous = true;
+        stopCur = () => { try { r.stop(); } catch {} };
+        r.onresult = (ev) => { let interim = '', finals = ''; for (let i = ev.resultIndex; i < ev.results.length; i++){ const x = ev.results[i]; if (x.isFinal) finals += x[0].transcript; else interim += x[0].transcript; } if (finals){ committed = (committed + ' ' + finals).trim(); } sessionText = interim; onPartial && onPartial(full()); bump(); };
+        r.onerror = () => {};
+        r.onend = () => { if (active){ try { r.start(); } catch {} } };
+        try { r.start(); } catch(e){ active = false; turnStop = null; resolve(''); }
         return;
       }
-      status('Voice input is not supported here.'); finish('');
+      status('Voice input is not supported here.'); active = false; turnStop = null; resolve('');
     });
   }
-  function stopListening(){ const f = stopListenFn; stopListenFn = null; if (f) f(); }
+  function stopTurn(){ if (turnStop) turnStop(); }
 
   // ---- Voice output ----
   let voices = [];
@@ -409,7 +427,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     const image = liveOpen ? captureFrame() : null;
     if (!question && !image) return;
     if (!cfg.endpoint || !cfg.token){ openSettings(); status('Add your endpoint and token first.'); return; }
-    busy = true; $('send').disabled = true; stopListening(); stopAudio();
+    busy = true; $('send').disabled = true; stopTurn(); stopAudio();
     if (!liveOpen) $('q').value = '';
     const firstMsg = chat.messages.length === 0;
     chat.messages.push({ role: 'user', content: question || '(photo)' });
@@ -449,8 +467,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   $('camera').onclick = openLive;
   $('lclose').onclick = closeLive;
   $('lflip').onclick = async () => { facing = facing === 'environment' ? 'user' : 'environment'; await startCamera($('lvideo')); };
-  $('lmic').onclick = () => { if (convoOn) pauseConvo(); else resumeConvo(); };
-  $('mic').onclick = async () => { if (listening){ stopListening(); return; } const t = await listenOnce(); if (t){ $('q').value = t; if (cfg.autosend) send(); } };
+  $('lmic').onclick = () => { if (convoOn){ stopConvo(); $('lcaption').textContent = 'Paused — tap the mic to talk.'; } else startConvo(); };
+  $('mic').onclick = () => { if (convoOn){ stopConvo(); status('Stopped listening.'); } else startConvo(); };
   $('composer').onsubmit = (e) => { e.preventDefault(); send(); };
   $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
   $('q').addEventListener('input', (e) => { const t = e.target; t.style.height = 'auto'; t.style.height = Math.min(150, t.scrollHeight) + 'px'; });
