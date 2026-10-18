@@ -7,11 +7,11 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Assistant">
+<meta name="apple-mobile-web-app-title" content="Rich AI">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<title>Assistant</title>
+<title>Rich AI</title>
 <style>
 :root{
   --bg:#ffffff; --surface:#ffffff; --surface-2:#f4f5f7; --text:#111318; --muted:#6a7280;
@@ -128,7 +128,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   <button class="iconbtn" id="menu" type="button" aria-label="Chats">
     <svg class="ic" viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
   </button>
-  <div class="title" id="htitle">Assistant</div>
+  <div class="title" id="htitle">Rich AI</div>
   <button class="iconbtn" id="newtop" type="button" aria-label="New chat">
     <svg class="ic" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>
   </button>
@@ -217,6 +217,10 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
       <label class="field">Speech recognition<select id="s-stt"><option value="eleven">ElevenLabs streaming (recommended)</option><option value="phone">Phone's built-in recognizer</option></select></label>
       <label class="field">Pause before sending<select id="s-pause"><option value="quick">Quick — sends sooner, may cut you off</option><option value="normal">Normal</option><option value="patient">Patient — waits longer for you</option></select></label>
     </div>
+    <div class="group">
+      <h3>Voice diagnostics</h3>
+      <pre id="diag" class="hint" style="white-space:pre-wrap;max-height:40vh;overflow:auto;margin:0;font-size:11px;line-height:1.4"></pre>
+    </div>
     <p class="hint" id="verline" style="text-align:center"></p>
   </div>
 </section>
@@ -226,7 +230,11 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 13:54 · 74bbc72';
+  const BUILD = '2026-10-18 14:00 · 71e724e';
+  const diag = [];
+  function dlog(m){ const d = new Date(); diag.push(d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0') + ' ' + m); if (diag.length > 60) diag.shift(); const el = $('diag'); if (el) el.textContent = diag.join('\n'); }
+  window.addEventListener('error', (e) => dlog('JS error: ' + (e.message || e.type)));
+  window.addEventListener('unhandledrejection', (e) => dlog('Unhandled: ' + ((e.reason && (e.reason.message || e.reason.name)) || e.reason)));
   const store = {
     get(k, d){ try{ const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }catch{ return d; } },
     set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch{} },
@@ -279,7 +287,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   function renderMessages(){
     const log = $('log'); log.innerHTML = '';
     const c = chats.find((x) => x.id === currentId);
-    $('htitle').textContent = (c && c.messages.length) ? c.title : 'Assistant';
+    $('htitle').textContent = (c && c.messages.length) ? c.title : 'Rich AI';
     if (!c || !c.messages.length){
       const e = document.createElement('div'); e.className = 'empty';
       e.innerHTML = '<div class="big">How can I help?</div><div class="sub">Ask anything. I can search the web, and you can tap the camera to show me something live.</div>';
@@ -345,8 +353,10 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     while (convoOn){
       if (liveOpen) $('lcaption').textContent = 'Listening…'; else status('Listening…');
       setListenUI(true);
+      dlog('listen: start (' + (cfg.stt === 'phone' ? 'phone' : 'stream') + ')');
       const text = await listenTurn((p) => setHeard(p));
       setListenUI(false);
+      dlog('listen: done -> ' + JSON.stringify((text || '').slice(0, 60)));
       if (!convoOn) break;
       if (!text){ await sleep(150); continue; }
       await send(text);
@@ -499,6 +509,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     micSrc.connect(micProc); micProc.connect(micSink); micSink.connect(micCtx.destination);
   }
   function closeMic(){
+    if (micStream) dlog('mic closed');
     micOnAudio = null;
     try { micSrc && micSrc.disconnect(); micProc && micProc.disconnect(); micSink && micSink.disconnect(); } catch {}
     try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch {}
@@ -524,10 +535,10 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
       let ws = null, committed = '', partial = '', done = false, started = false, trailingWait = null, startTimer = null;
       const full = () => (committed + ' ' + partial).replace(/\s+/g, ' ').trim();
       const finish = (val) => { if (done) return; done = true; clearTimeout(trailingWait); clearTimeout(startTimer); closeMic(); turnStop = null; try { ws && ws.close(); } catch {} resolve(val); };
-      const unavailable = (why) => { sttDownUntil = Date.now() + 60*1000; status('Streaming voice unavailable (' + why + '); using the phone recognizer for a minute.'); finish(null); };
+      const unavailable = (why) => { dlog('stream unavailable: ' + why); sttDownUntil = Date.now() + 60*1000; status('Streaming voice unavailable (' + why + '); using the phone recognizer for a minute.'); finish(null); };
       turnStop = () => finish(full());
-      try { await openMic(); } catch (e) { unavailable('mic: ' + ((e && e.name) || 'blocked')); return; }
-      let tok; try { tok = await takeSttToken(); } catch (e) { unavailable(e.message); return; }
+      try { await openMic(); dlog('mic open @' + micCtx.sampleRate + 'Hz'); } catch (e) { dlog('mic failed: ' + ((e && e.name) || e)); unavailable('mic: ' + ((e && e.name) || 'blocked')); return; }
+      let tok; try { tok = await takeSttToken(); dlog('token ok'); } catch (e) { dlog('token failed: ' + e.message); unavailable(e.message); return; }
       if (done) return;
       const ctxRate = micCtx.sampleRate, rate = 16000;   // always send 16 kHz: a third of the bandwidth of 48 kHz, and what the model prefers
       const silence = VAD_SILENCE[cfg.pause] || VAD_SILENCE.normal;
@@ -542,13 +553,14 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
         let m; try { m = JSON.parse(ev.data); } catch { return; }
         const t = m.message_type;
         if (t === 'session_started'){
-          started = true; clearTimeout(startTimer);
+          started = true; clearTimeout(startTimer); dlog('stream: session started');
           micOnAudio = (f32) => { if (ws.readyState === 1) ws.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: pcm16b64(f32, ctxRate, rate), commit: false, sample_rate: rate })); };
           prefetchSttToken();
         } else if (t === 'partial_transcript'){
           partial = m.text || ''; if (partial){ clearTimeout(trailingWait); trailingWait = null; onPartial && onPartial(full()); }
         } else if (t === 'committed_transcript'){
           if (m.text && m.text.trim()) committed = (committed + ' ' + m.text.trim()).trim();
+          dlog('stream: commit ' + JSON.stringify((m.text || '').slice(0, 40)));
           partial = ''; onPartial && onPartial(full());
           if (!full()) return;                        // a commit of silence/noise: keep listening
           // Trailing off on "and", "but", "um"? You're probably mid-thought: give it a few more seconds.
@@ -572,8 +584,36 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   let player = null;
   function stopAudio(){ try{ if(player){ player.onended=null; player.pause(); player.src=''; player=null; } }catch{} try{ if(window.speechSynthesis)speechSynthesis.cancel(); }catch{} }
   function ttsUrl(){ return (cfg.endpoint||'').replace(/\/[^/]*$/, '/tts'); }
-  async function speakPremium(text, voiceId){ const res=await fetch(ttsUrl(),{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+cfg.token},body:JSON.stringify({text,voice_id:((voiceId||cfg.elVoice||'').trim())||undefined})}); if(!res.ok)throw new Error('tts '+res.status); const blob=await res.blob(),u=URL.createObjectURL(blob); stopAudio(); await new Promise((resolve)=>{ player=new Audio(u); player.onended=()=>{try{URL.revokeObjectURL(u);}catch{} resolve();}; player.onerror=()=>{ status('Voice playback failed.'); resolve(); }; player.play().catch((e)=>{ status('Voice playback blocked: ' + ((e && e.name) || 'error')); resolve(); }); }); }
-  async function speak(text){ if(!cfg.voice||!text)return; if(cfg.premium&&cfg.endpoint&&cfg.token){ try{ await speakPremium(text); }catch(e){ status('Premium voice failed (' + (e && e.message || 'error') + '); using phone voice.'); await speakWith(text,bestVoice()); } } else { await speakWith(text,bestVoice()); } }
+  async function speakPremium(text, voiceId){
+    const t0 = Date.now();
+    const res = await fetch(ttsUrl(), { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+cfg.token }, body: JSON.stringify({ text, voice_id: ((voiceId||cfg.elVoice||'').trim()) || undefined }) });
+    if (!res.ok) throw new Error('tts ' + res.status);
+    const blob = await res.blob(), u = URL.createObjectURL(blob);
+    dlog('tts: ' + blob.size + ' bytes in ' + (Date.now() - t0) + 'ms');
+    stopAudio();
+    await sleep(250);   // let Android switch out of call-style routing after the mic closed
+    await new Promise((resolve) => {
+      const started = Date.now(); let tries = 0;
+      player = new Audio(u); player.volume = 1;
+      player.onended = () => { dlog('play: ended after ' + (Date.now() - started) + 'ms (duration ' + (player && player.duration ? player.duration.toFixed(1) : '?') + 's)'); try { URL.revokeObjectURL(u); } catch {} resolve(); };
+      player.onerror = () => { dlog('play: error ' + (player && player.error ? player.error.code : '?')); status('Voice playback failed.'); resolve(); };
+      player.onplaying = () => dlog('play: playing (duration ' + (player && player.duration ? player.duration.toFixed(1) : '?') + 's)');
+      const go = () => player.play().then(() => dlog('play: started')).catch((e) => {
+        dlog('play: rejected ' + ((e && e.name) || e) + (tries ? '' : ', retrying'));
+        if (tries++ < 1) setTimeout(go, 400); else { status('Voice playback blocked: ' + ((e && e.name) || 'error')); resolve(); }
+      });
+      go();
+    });
+  }
+  async function speak(text){
+    if (!cfg.voice || !text){ dlog('speak: skipped (voice ' + (cfg.voice ? 'on' : 'OFF') + ')'); return; }
+    if (cfg.premium && cfg.endpoint && cfg.token){
+      try { dlog('speak: premium'); await speakPremium(text); return; }
+      catch (e) { dlog('speak: premium failed ' + (e && e.message || e)); status('Premium voice failed (' + (e && e.message || 'error') + '); using phone voice.'); }
+    } else dlog('speak: phone voice (premium ' + (cfg.premium ? 'on' : 'OFF') + ')');
+    if (!window.speechSynthesis) dlog('speak: no speechSynthesis on this device');
+    await speakWith(text, bestVoice());
+  }
   async function loadPremiumVoices(){ const sel=$('s-elvoice'); if(!sel)return; sel.innerHTML=''; const def=document.createElement('option'); def.value=''; def.textContent='Automatic (default)'; sel.appendChild(def); sel.value=cfg.elVoice||''; if(!cfg.endpoint||!cfg.token)return; try{ const res=await fetch(ttsUrl(),{headers:{'Authorization':'Bearer '+cfg.token}}); if(!res.ok)return; const data=await res.json(); for(const v of (data.voices||[])){ const o=document.createElement('option'); o.value=v.id; o.textContent=v.name; sel.appendChild(o);} sel.value=cfg.elVoice||''; }catch{} }
 
   // ---- Send ----
@@ -610,7 +650,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   }
 
   // ---- Settings ----
-  function openSettings(){ $('s-endpoint').value=cfg.endpoint; $('s-token').value=cfg.token; $('s-voice').checked=cfg.voice; $('s-autosend').checked=cfg.autosend; $('s-pause').value=cfg.pause||'normal'; $('s-stt').value=cfg.stt||'eleven'; $('s-premium').checked=cfg.premium; loadVoices(); $('s-voicepick').value=cfg.voiceURI||''; loadPremiumVoices(); $('verline').textContent = 'Version ' + (BUILD.startsWith('__') ? 'dev (unpublished)' : BUILD); closeDrawer(); $('settings').classList.add('open'); }
+  function openSettings(){ $('s-endpoint').value=cfg.endpoint; $('s-token').value=cfg.token; $('s-voice').checked=cfg.voice; $('s-autosend').checked=cfg.autosend; $('s-pause').value=cfg.pause||'normal'; $('s-stt').value=cfg.stt||'eleven'; $('s-premium').checked=cfg.premium; loadVoices(); $('s-voicepick').value=cfg.voiceURI||''; loadPremiumVoices(); $('diag').textContent = diag.join('\n') || '(no voice activity yet)'; $('verline').textContent = 'Version ' + (BUILD.startsWith('__') ? 'dev (unpublished)' : BUILD); closeDrawer(); $('settings').classList.add('open'); }
   function saveSettings(){ cfg.endpoint=$('s-endpoint').value.trim(); cfg.token=$('s-token').value.trim(); cfg.voice=$('s-voice').checked; cfg.autosend=$('s-autosend').checked; cfg.pause=$('s-pause').value||'normal'; cfg.stt=$('s-stt').value||'eleven'; cfg.voiceURI=$('s-voicepick').value; cfg.premium=$('s-premium').checked; cfg.elVoice=$('s-elvoice').value; for(const k of ['endpoint','token','voice','autosend','pause','stt','voiceURI','premium','elVoice']) store.set(k,cfg[k]); }
 
   // ---- Wire up ----

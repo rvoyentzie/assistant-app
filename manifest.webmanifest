@@ -1,6 +1,6 @@
 {
-  "name": "Assistant",
-  "short_name": "Assistant",
+  "name": "Rich AI",
+  "short_name": "Rich AI",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
