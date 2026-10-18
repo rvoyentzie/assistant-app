@@ -230,9 +230,9 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 14:00 · 71e724e';
+  const BUILD = '2026-10-18 14:09 · da5cee3';
   const diag = [];
-  function dlog(m){ const d = new Date(); diag.push(d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0') + ' ' + m); if (diag.length > 60) diag.shift(); const el = $('diag'); if (el) el.textContent = diag.join('\n'); }
+  function dlog(m){ try { console.log('[voice] ' + m); } catch {} const d = new Date(); diag.push(d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0') + ' ' + m); if (diag.length > 60) diag.shift(); const el = $('diag'); if (el) el.textContent = diag.join('\n'); }
   window.addEventListener('error', (e) => dlog('JS error: ' + (e.message || e.type)));
   window.addEventListener('unhandledrejection', (e) => dlog('Unhandled: ' + ((e.reason && (e.reason.message || e.reason.name)) || e.reason)));
   const store = {
@@ -473,6 +473,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     });
   }
   function stopTurn(){ if (turnStop) turnStop(); }
+  // For USB debugging (chrome://inspect / adb): read the log and poke the pieces from DevTools.
+  window.__rich = { diag, cfg, speak: (t) => speak(t || 'Testing the voice.'), speakPremium: (t) => speakPremium(t || 'Testing the premium voice.'), startConvo, stopConvo, openMic, closeMic };
 
   // ---- Streaming speech-to-text: ElevenLabs Scribe v2 Realtime ----
   // The mic stays open for the whole turn and raw PCM is streamed over a WebSocket; the
