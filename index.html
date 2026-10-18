@@ -230,7 +230,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 (() => {
   const $ = (id) => document.getElementById(id);
   // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
-  const BUILD = '2026-10-18 14:15 · 38c74af';
+  const BUILD = '2026-10-18 14:21 · 7fa1620';
   const diag = [];
   function dlog(m){ try { console.log('[voice] ' + m); } catch {} const d = new Date(); diag.push(d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0') + ' ' + m); if (diag.length > 60) diag.shift(); const el = $('diag'); if (el) el.textContent = diag.join('\n'); }
   window.addEventListener('error', (e) => dlog('JS error: ' + (e.message || e.type)));
@@ -620,6 +620,16 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   }
   async function loadPremiumVoices(){ const sel=$('s-elvoice'); if(!sel)return; sel.innerHTML=''; const def=document.createElement('option'); def.value=''; def.textContent='Automatic (default)'; sel.appendChild(def); sel.value=cfg.elVoice||''; if(!cfg.endpoint||!cfg.token)return; try{ const res=await fetch(ttsUrl(),{headers:{'Authorization':'Bearer '+cfg.token}}); if(!res.ok)return; const data=await res.json(); for(const v of (data.voices||[])){ const o=document.createElement('option'); o.value=v.id; o.textContent=v.name; sel.appendChild(o);} sel.value=cfg.elVoice||''; }catch{} }
 
+  // The last 12 turns go back with each request. Assistant turns carry the actions they took
+  // (send_sms → sent…, place_call → calling…) so the model knows what really happened, not just
+  // what it said; the bubbles on screen show only the reply text.
+  function historyFor(chat){
+    return chat.messages.slice(0, -1).slice(-12).map((m) => {
+      if (m.role !== 'assistant' || !m.tools || !m.tools.length) return { role: m.role, content: m.content };
+      return { role: 'assistant', content: m.content + '\n[Actions taken this turn: ' + m.tools.map((t) => t.name + ' → ' + t.summary).join('; ') + ']' };
+    });
+  }
+
   // ---- Send ----
   async function send(spoken){
     if (busy) return;
@@ -640,12 +650,12 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
     let thinking = null;
     if (!liveOpen){ thinking = bubble('bot', ''); thinking.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>'; scrollToBottom(); }
     try{
-      const res = await fetch(cfg.endpoint, { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+cfg.token }, body: JSON.stringify({ question, image: image ? { media_type:'image/jpeg', data:image } : undefined, history: chat.messages.slice(0, -1).slice(-12) }) });
+      const res = await fetch(cfg.endpoint, { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+cfg.token }, body: JSON.stringify({ question, image: image ? { media_type:'image/jpeg', data:image } : undefined, history: historyFor(chat) }) });
       const data = await res.json().catch(() => ({}));
       if (thinking) thinking.remove();
       if (!res.ok){ const em = 'Error ' + res.status + ': ' + (data.error || res.statusText); if (!liveOpen){ bubble('sys', em); scrollToBottom(); } else status(em); return; }
       const answer = data.text || '(no answer)';
-      chat.messages.push({ role: 'assistant', content: answer }); chat.updatedAt = Date.now(); saveChats();
+      chat.messages.push({ role: 'assistant', content: answer, tools: (data.tool_events || []).map((ev) => ({ name: ev.name, summary: String(ev.summary || '').slice(0, 160) })) }); chat.updatedAt = Date.now(); saveChats();
       if (!liveOpen){ bubble('bot', answer); for (const ev of (data.tool_events || [])) bubble('sys', ev.name + ': ' + ev.summary); scrollToBottom(); renderDrawer(); }
       else { $('lcaption').textContent = answer; }
       await speak(answer);
