@@ -215,6 +215,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
       <h3>Behavior</h3>
       <div class="row"><span>Send when I stop talking</span><label class="switch"><input type="checkbox" id="s-autosend" checked><span></span></label></div>
     </div>
+    <p class="hint" id="verline" style="text-align:center"></p>
   </div>
 </section>
 
@@ -222,6 +223,8 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
+  // Stamped by tools/publish_app.sh at publish time (date, time, and commit), so Settings shows which build is running.
+  const BUILD = '2026-10-18 12:24 · 4205bad';
   const store = {
     get(k, d){ try{ const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }catch{ return d; } },
     set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch{} },
@@ -484,7 +487,7 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   }
 
   // ---- Settings ----
-  function openSettings(){ $('s-endpoint').value=cfg.endpoint; $('s-token').value=cfg.token; $('s-voice').checked=cfg.voice; $('s-autosend').checked=cfg.autosend; $('s-premium').checked=cfg.premium; loadVoices(); $('s-voicepick').value=cfg.voiceURI||''; loadPremiumVoices(); closeDrawer(); $('settings').classList.add('open'); }
+  function openSettings(){ $('s-endpoint').value=cfg.endpoint; $('s-token').value=cfg.token; $('s-voice').checked=cfg.voice; $('s-autosend').checked=cfg.autosend; $('s-premium').checked=cfg.premium; loadVoices(); $('s-voicepick').value=cfg.voiceURI||''; loadPremiumVoices(); $('verline').textContent = 'Version ' + (BUILD.startsWith('__') ? 'dev (unpublished)' : BUILD); closeDrawer(); $('settings').classList.add('open'); }
   function saveSettings(){ cfg.endpoint=$('s-endpoint').value.trim(); cfg.token=$('s-token').value.trim(); cfg.voice=$('s-voice').checked; cfg.autosend=$('s-autosend').checked; cfg.voiceURI=$('s-voicepick').value; cfg.premium=$('s-premium').checked; cfg.elVoice=$('s-elvoice').value; for(const k of ['endpoint','token','voice','autosend','voiceURI','premium','elVoice']) store.set(k,cfg[k]); }
 
   // ---- Wire up ----
