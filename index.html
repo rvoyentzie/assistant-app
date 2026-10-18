@@ -364,30 +364,61 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
   function listenTurn(onPartial){
     return new Promise((resolve) => {
       const NSR = getNativeSR();
-      let committed = '', sessionText = '', active = true, restarting = false, silence = null, stopCur = () => {};
+      let committed = '', sessionText = '', active = true, restarting = false, silence = null, done = false;
+      const cleanups = [() => clearTimeout(silence)];
       const full = () => (committed + ' ' + sessionText).replace(/\s+/g, ' ').trim();
+      const finishNow = () => { if (done) return; done = true; cleanups.forEach((f) => { try { f(); } catch {} }); turnStop = null; resolve(full()); };
       const bump = () => { clearTimeout(silence); silence = setTimeout(endTurn, END_SILENCE_MS); };
-      function endTurn(){ if (!active) return; active = false; clearTimeout(silence); try { stopCur(); } catch {} turnStop = null; resolve(full()); }
+      let stopCur = () => {};
+      // End the turn: stop the recognizer but give it a moment to deliver its FINAL result first.
+      // The last word usually arrives only in that final, not in the live partials.
+      function endTurn(){ if (!active) return; active = false; clearTimeout(silence); try { stopCur(); } catch {} setTimeout(finishNow, 700); }
       turnStop = endTurn;
+
       if (NSR){
-        stopCur = async () => { try { await NSR.stop(); } catch {} try { await NSR.removeAllListeners(); } catch {} };
+        // Plugin facts (from its source): with partialResults on, the session's FINAL transcript is
+        // delivered as one more 'partialResults' event, and it comes AFTER the 'stopped' event; stop()
+        // and errors emit no event at all. So: commit a session only when its final arrives.
+        let awaitingFinal = false, finalWait = null, sessionAlive = false, sessionStartedAt = 0;
+        stopCur = () => { NSR.stop().catch(() => {}); };
+        function commitAndRestart(){
+          awaitingFinal = false; clearTimeout(finalWait); sessionAlive = false;
+          if (sessionText){ committed = (committed + ' ' + sessionText).trim(); sessionText = ''; onPartial && onPartial(full()); }
+          if (!active){ finishNow(); return; }
+          if (full()) bump();   // you've said something: wait END_SILENCE_MS for more before sending
+          if (!restarting){ restarting = true; setTimeout(() => { restarting = false; if (active) startSession(); }, 120); }
+        }
         async function startSession(){
-          sessionText = '';
+          if (!active) return;
+          sessionText = ''; awaitingFinal = false; clearTimeout(finalWait);
           try { await NSR.removeAllListeners(); } catch {}
           try {
-            await NSR.addListener('partialResults', (d) => { const m = (d && d.matches && d.matches[0]) || ''; if (m){ sessionText = m; onPartial && onPartial(full()); bump(); } });
+            await NSR.addListener('partialResults', (d) => {
+              const m = (d && d.matches && d.matches[0]) || ''; if (!m) return;
+              sessionText = m; onPartial && onPartial(full()); bump();
+              if (awaitingFinal) commitAndRestart();   // this was the session's final transcript
+            });
             await NSR.addListener('listeningState', (d) => {
               if (d && d.status === 'stopped'){
-                if (sessionText){ committed = (committed + ' ' + sessionText).trim(); sessionText = ''; }
-                if (active && !restarting){ restarting = true; setTimeout(() => { restarting = false; if (active) startSession(); }, 120); }
+                awaitingFinal = true; clearTimeout(finalWait);
+                finalWait = setTimeout(() => { if (awaitingFinal) commitAndRestart(); }, 500);
               }
             });
           } catch {}
+          sessionAlive = true; sessionStartedAt = Date.now();
           try { await NSR.start({ language: navigator.language || 'en-US', partialResults: true, popup: false }); }
-          catch(e){ if (active && !restarting){ restarting = true; setTimeout(() => { restarting = false; if (active) startSession(); }, 250); } }
+          catch(e){ sessionAlive = false; if (active && !restarting){ restarting = true; setTimeout(() => { restarting = false; if (active) startSession(); }, 250); } }
         }
+        // Watchdog: the recognizer can end on an error (e.g. no speech) with no event, which would
+        // leave us silently not listening. If it has stopped and no final is pending, restart.
+        const watchdog = setInterval(async () => {
+          if (!active) return;
+          if (!sessionAlive || awaitingFinal || restarting || Date.now() - sessionStartedAt < 1500) return;
+          try { const s = await NSR.isListening(); if (s && s.listening === false) commitAndRestart(); } catch {}
+        }, 1200);
+        cleanups.push(() => clearInterval(watchdog), () => clearTimeout(finalWait));
         (async () => {
-          try { let p = await NSR.checkPermissions(); if (p.speechRecognition !== 'granted'){ p = await NSR.requestPermissions(); if (p.speechRecognition !== 'granted'){ status('Allow the microphone to use voice.'); active = false; turnStop = null; resolve(''); return; } } } catch {}
+          try { let p = await NSR.checkPermissions(); if (p.speechRecognition !== 'granted'){ p = await NSR.requestPermissions(); if (p.speechRecognition !== 'granted'){ status('Allow the microphone to use voice.'); active = false; finishNow(); return; } } } catch {}
           startSession();
         })();
         return;
@@ -397,11 +428,11 @@ label.field input:focus,label.field select:focus{outline:none;border-color:var(-
         stopCur = () => { try { r.stop(); } catch {} };
         r.onresult = (ev) => { let interim = '', finals = ''; for (let i = ev.resultIndex; i < ev.results.length; i++){ const x = ev.results[i]; if (x.isFinal) finals += x[0].transcript; else interim += x[0].transcript; } if (finals){ committed = (committed + ' ' + finals).trim(); } sessionText = interim; onPartial && onPartial(full()); bump(); };
         r.onerror = () => {};
-        r.onend = () => { if (active){ try { r.start(); } catch {} } };
-        try { r.start(); } catch(e){ active = false; turnStop = null; resolve(''); }
+        r.onend = () => { if (!active){ finishNow(); return; } try { r.start(); } catch {} };
+        try { r.start(); } catch(e){ active = false; finishNow(); }
         return;
       }
-      status('Voice input is not supported here.'); active = false; turnStop = null; resolve('');
+      status('Voice input is not supported here.'); active = false; finishNow();
     });
   }
   function stopTurn(){ if (turnStop) turnStop(); }
